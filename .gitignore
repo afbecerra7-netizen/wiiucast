@@ -1,0 +1,6 @@
+# Artefactos de compilación devkitPro/wut
+build/
+*.elf
+*.rpx
+*.wuhb
+*.map
