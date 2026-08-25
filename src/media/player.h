@@ -44,4 +44,7 @@ double player_position(void);     // segundos reproducidos
 double player_duration(void);     // segundos totales (0 si se desconoce)
 int player_progress_pct(void);    // % descargado (-1 si no hay tamaño)
 double player_mbps(void);         // velocidad de descarga medida
+BOOL player_is_rebuffering(void);
+double player_fps(void);          // fotogramas por segundo realmente mostrados
+int player_recent_pts(double *out, int max);  // PTS de los últimos mostrados
 uint32_t player_frames_shown(void);

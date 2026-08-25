@@ -37,8 +37,10 @@ static int s_queued;
 
 static uint32_t s_shown;
 
-static void on_frame(int index, double pts, int w, int h, int pitch, void *user)
+static void on_frame(void *framebuffer, double pts, int w, int h, int pitch, void *user)
 {
+   int index = video_renderer_index_of(framebuffer);
+   if (index < 0) return;
    if (s_queued >= QUEUE_MAX) return;   // el llamador regula, no debería pasar
    for (int i = 0; i < QUEUE_MAX; i++) {
       if (!s_queue[i].used) {
@@ -150,7 +152,7 @@ int main(int argc, char **argv)
          if (conv == 0) { next++; continue; }
 
          decoder_submit(bitstream, len + conv, s->pts,
-                        video_renderer_framebuffer(fbIndex), fbIndex);
+                        video_renderer_framebuffer(fbIndex));
          fbIndex = (fbIndex + 1) % VIDEO_NUM_BUFFERS;
          next++;
       }

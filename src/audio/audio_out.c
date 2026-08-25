@@ -209,11 +209,17 @@ uint32_t audio_out_write(const int16_t *interleaved, uint32_t frames)
 {
    if (!s_ready || frames == 0) return 0;
 
-   uint32_t space = audio_out_space();
-   if (frames > space) frames = space;
-   if (frames == 0) return 0;
-
    OSLockMutex(&s_mutex);
+   // El hueco se calcula aquí dentro: consultar el cursor del DSP es una
+   // llamada al hardware, y hacerla dos veces por frame de audio se notaba.
+   {
+      uint64_t played = played_frames_locked();
+      uint64_t queued = (s_written > played) ? (s_written - played) : 0;
+      uint32_t space = (queued >= RING_FRAMES - 1)
+                          ? 0 : (uint32_t)(RING_FRAMES - 1 - queued);
+      if (frames > space) frames = space;
+   }
+   if (frames == 0) { OSUnlockMutex(&s_mutex); return 0; }
    for (uint32_t i = 0; i < frames; i++) {
       uint32_t slot = (s_writePos + i) % RING_FRAMES;
       for (int c = 0; c < s_channels; c++) {
@@ -239,7 +245,14 @@ uint32_t audio_out_write(const int16_t *interleaved, uint32_t frames)
    // viejo. Dejando ceros justo detrás de lo escrito, un adelanto se oye como
    // silencio en vez de como un eco.
    {
+      // Solo se silencia el hueco LIBRE: pasarse pisaría audio ya encolado
+      // que aún no ha sonado, y eso se oye como cortes.
+      uint64_t played2 = played_frames_locked();
+      uint64_t queued2 = (s_written > played2) ? (s_written - played2) : 0;
+      uint32_t freeSpace = (queued2 >= RING_FRAMES) ? 0
+                              : (uint32_t)(RING_FRAMES - queued2);
       uint32_t guard = 2048;
+      if (guard > freeSpace) guard = freeSpace;
       if (guard > RING_FRAMES / 4) guard = RING_FRAMES / 4;
       for (int c = 0; c < s_channels; c++) {
          uint32_t start = s_writePos;

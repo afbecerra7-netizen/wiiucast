@@ -251,8 +251,15 @@ static int fetch_thread(int argc, const char **argv)
       if (!wait_for_space(payload)) break;
 
       OSLockMutex(&s_mutex);
-      for (uint32_t i = 0; i < payload; i++) {
-         s_ring[(s_filled + i) % RING_SIZE] = chunk[dataOff + i];
+      {
+         uint32_t start = (uint32_t)(s_filled % RING_SIZE);
+         uint32_t first = RING_SIZE - start;
+         if (payload <= first) {
+            memcpy(&s_ring[start], chunk + dataOff, payload);
+         } else {
+            memcpy(&s_ring[start], chunk + dataOff, first);
+            memcpy(&s_ring[0], chunk + dataOff + first, payload - first);
+         }
       }
       s_filled += payload;
       OSUnlockMutex(&s_mutex);
@@ -293,7 +300,7 @@ BOOL fetch_start(const char *url)
 
    if (!OSCreateThread(&s_thread, fetch_thread, 0, NULL,
                        s_stack + 256 * 1024, 256 * 1024, 16,
-                       OS_THREAD_ATTRIB_AFFINITY_ANY)) {
+                       OS_THREAD_ATTRIB_AFFINITY_ANY | OS_THREAD_ATTRIB_DETACHED)) {
       set_error("no se pudo crear el hilo de descarga");
       return FALSE;
    }
@@ -308,7 +315,10 @@ void fetch_stop(void)
    if (s_state == FETCH_IDLE) return;
    s_stopRequested = TRUE;
 
-   // Desbloquear el recv() del hilo: sin esto OSJoinThread no vuelve nunca.
+   // Cerrarle el socket hace que su recv() vuelva y el hilo termine solo.
+   // NO se le espera con OSJoinThread: es una espera sin timeout y bloquear
+   // aquí cuelga la consola (esto se llama desde el callback de ProcUI, que
+   // debe volver rápido). El hilo es DETACHED y se recoge solo.
    int fd = s_sock;
    if (fd >= 0) {
       s_sock = -1;
@@ -316,7 +326,6 @@ void fetch_stop(void)
       close(fd);
    }
 
-   OSJoinThread(&s_thread, NULL);
    s_state = FETCH_IDLE;
    s_windowStart = s_filled = s_totalSize = 0;
 }
@@ -360,8 +369,16 @@ int fetch_read(uint64_t offset, void *buf, uint32_t len)
       uint32_t avail = (uint32_t)(s_filled - offset);
       uint32_t take = (len < avail) ? len : avail;
       uint8_t *dst = (uint8_t *)buf;
-      for (uint32_t i = 0; i < take; i++) {
-         dst[i] = s_ring[(offset + i) % RING_SIZE];
+      // Dos memcpy (el anillo da la vuelta como mucho una vez). Copiar byte a
+      // byte con un módulo por byte costaba milisegundos por fotograma y era
+      // lo que dejaba el vídeo a saltos.
+      uint32_t start = (uint32_t)(offset % RING_SIZE);
+      uint32_t first = RING_SIZE - start;
+      if (take <= first) {
+         memcpy(dst, &s_ring[start], take);
+      } else {
+         memcpy(dst, &s_ring[start], first);
+         memcpy(dst + first, &s_ring[0], take - first);
       }
       result = (int)take;
    }

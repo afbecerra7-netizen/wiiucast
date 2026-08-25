@@ -15,20 +15,16 @@ static void *s_user;
 static uint32_t s_framesOut, s_errors;
 static BOOL s_open;
 
-// El callback corre SÍNCRONO dentro de H264DECExecute, y el decoder escribe
-// el frame que emite en el buffer que se le acaba de pasar a ESA llamada —
-// no en el de la llamada que metió ese frame (en modo buffered la salida va
-// desfasada de la entrada por el reordenado de B-frames). Por eso basta con
-// recordar el índice de la llamada en curso.
-static int s_currentIndex = -1;
-
+// El decoder reporta en cada resultado la dirección donde dejó el frame. Es
+// el único dato fiable: en modo buffered la salida va reordenada respecto a
+// la entrada, así que no se puede deducir del orden de las llamadas.
 static void frame_callback(H264DecodeOutput *output)
 {
    for (int32_t i = 0; i < output->frameCount; i++) {
       H264DecodeResult *r = output->decodeResults[i];
       s_framesOut++;
-      if (s_currentIndex >= 0 && s_onFrame) {
-         s_onFrame(s_currentIndex, r->timestamp, r->width, r->height,
+      if (r->framebuffer && s_onFrame) {
+         s_onFrame(r->framebuffer, r->timestamp, r->width, r->height,
                    r->nextLine, s_user);
       }
    }
@@ -80,7 +76,6 @@ BOOL decoder_open(int profile, int level, int width, int height,
    s_onFrame = onFrame;
    s_user = user;
    s_framesOut = s_errors = 0;
-   s_currentIndex = -1;
    s_open = TRUE;
 
    WHBLogPrintf("[dec] abierto: %dx%d perfil %d nivel %d (%u KB)",
@@ -89,7 +84,7 @@ BOOL decoder_open(int profile, int level, int width, int height,
 }
 
 BOOL decoder_submit(const uint8_t *annexb, uint32_t len, double pts,
-                    void *frameBuffer, int index)
+                    void *frameBuffer)
 {
    if (!s_open) return FALSE;
 
@@ -99,9 +94,7 @@ BOOL decoder_submit(const uint8_t *annexb, uint32_t len, double pts,
       return FALSE;
    }
 
-   s_currentIndex = index;
    H264Error xe = H264DECExecute(s_mem, frameBuffer);
-   s_currentIndex = -1;
 
    // Convención heredada de moonlight: el byte bajo trae información de
    // estado; cualquier bit por encima señala error real.

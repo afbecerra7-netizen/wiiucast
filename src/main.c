@@ -48,7 +48,7 @@ static const char *state_name(void)
 {
    switch (player_state()) {
       case PLAYER_BUFFERING: return "Cargando";
-      case PLAYER_PLAYING:   return "Reproduciendo";
+      case PLAYER_PLAYING:   return player_is_rebuffering() ? "Cargando..." : "Reproduciendo";
       case PLAYER_PAUSED:    return "En pausa";
       case PLAYER_ENDED:     return "Terminado";
       case PLAYER_FAILED:    return "Error";
@@ -81,6 +81,19 @@ static int handle_request(const char *method, const char *path, const char *quer
       return 200;
    }
 
+   // Traza de diagnóstico: PTS de los últimos fotogramas presentados.
+   if (strcmp(path, "/frames") == 0) {
+      *contentType = "text/plain";
+      double pts[10];
+      int n = player_recent_pts(pts, 10);
+      int o = 0;
+      o += snprintf(out + o, outCap - o, "ultimos mostrados (nuevo -> viejo):\n");
+      for (int i = 0; i < n && o < (int)outCap - 40; i++) {
+         o += snprintf(out + o, outCap - o, "  %.3f\n", pts[i]);
+      }
+      return 200;
+   }
+
    if (strcmp(path, "/status") == 0) {
       *contentType = "application/json";
       char escUrl[600], escNote[300];
@@ -89,10 +102,10 @@ static int handle_request(const char *method, const char *path, const char *quer
                   escNote, sizeof(escNote));
       snprintf(out, outCap,
                "{\"state\":\"%s\",\"url\":\"%s\",\"casts\":%u,"
-               "\"pos\":%.1f,\"dur\":%.1f,\"dl\":%d,\"mbps\":%.2f,\"note\":\"%s\"}",
+               "\"pos\":%.1f,\"dur\":%.1f,\"dl\":%d,\"mbps\":%.2f,\"fps\":%.1f,\"note\":\"%s\"}",
                state_name(), escUrl, g_app.casts,
                player_position(), player_duration(),
-               player_progress_pct(), player_mbps(), escNote);
+               player_progress_pct(), player_mbps(), player_fps(), escNote);
       return 200;
    }
 

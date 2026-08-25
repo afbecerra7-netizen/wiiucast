@@ -198,6 +198,15 @@ void *video_renderer_framebuffer(int index)
    return s_frames[index].yTex.surface.image;
 }
 
+int video_renderer_index_of(const void *ptr)
+{
+   if (!ptr) return -1;
+   for (int i = 0; i < VIDEO_NUM_BUFFERS; i++) {
+      if (s_frames[i].yTex.surface.image == ptr) return i;
+   }
+   return -1;
+}
+
 void video_renderer_submit(int index)
 {
    if (index < 0 || index >= VIDEO_NUM_BUFFERS || !s_frames[index].valid) return;

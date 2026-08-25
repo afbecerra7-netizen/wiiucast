@@ -24,10 +24,18 @@ BOOL video_renderer_has_foreground(void);
 // cambiar de medio (libera las anteriores). Devuelve FALSE si no hay memoria.
 BOOL video_renderer_set_size(int width, int height);
 
-// Buffer NV12 donde el decoder debe escribir el frame `index`
-// (0 <= index < VIDEO_NUM_BUFFERS). Es memoria de textura GX2.
-#define VIDEO_NUM_BUFFERS 2
+// Buffers NV12 donde el decoder escribe. Tienen que ser MÁS que los frames
+// que el decoder retiene en modo buffered (~5), o reutiliza uno que todavía
+// está en la cola de presentación y se ven fotogramas desordenados.
+// Cuenta: el decoder retiene ~5 fotogramas en modo buffered y la cola de
+// presentación admite 3, o sea 8 vivos a la vez. Con 12 hay margen de sobra
+// para que ninguno se reutilice antes de mostrarse.
+#define VIDEO_NUM_BUFFERS 12
 void *video_renderer_framebuffer(int index);
+
+// Índice del buffer cuya memoria empieza en `ptr`, o -1 si no es ninguno.
+// Hace falta porque el decoder identifica sus frames por dirección.
+int video_renderer_index_of(const void *ptr);
 
 // Marca el buffer `index` como listo para mostrar.
 void video_renderer_submit(int index);

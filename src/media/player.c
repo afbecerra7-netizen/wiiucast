@@ -62,7 +62,27 @@ static struct {
    BOOL audioDrained;
    OSTime drainAnchor;
    double drainClock;
+
+   // Rebuffering: si la red no da para el bitrate del medio, es mucho mejor
+   // parar y acumular que reproducir a trompicones. Se vuelve a arrancar con
+   // REBUFFER_BYTES por delante.
+   BOOL rebuffering;
+   double rebufferClock;   // reloj donde se paró, para reanudar sin saltar
+
+   // Medición de cadencia real: sin esto no hay forma de distinguir "va a
+   // saltos" por decodificación lenta de "va a saltos" por sincronía.
+   OSTime fpsWindow;
+   uint32_t fpsFrames;
+   double fpsValue;
+
+   // Traza de los últimos fotogramas presentados: la única forma de ver
+   // desde fuera si salen en orden o dando saltos.
+   double lastShown[10];
+   int lastShownCount;
 } P;
+
+// Margen que se acumula antes de (re)arrancar. A 8 Mbps son ~4 segundos.
+#define REBUFFER_BYTES (4u * 1024 * 1024)
 
 void player_set_display_cb(PlayerDisplayFn fn) { P.displayCb = fn; }
 
@@ -75,9 +95,11 @@ static void set_failed(const char *msg)
 }
 
 // ---------------------------------------------------------------------------
-static void on_frame(int index, double pts, int w, int h, int pitch, void *user)
+static void on_frame(void *framebuffer, double pts, int w, int h, int pitch, void *user)
 {
    (void)w; (void)h; (void)pitch; (void)user;
+   int index = video_renderer_index_of(framebuffer);
+   if (index < 0) return;   // frame en memoria que no es nuestra: descartar
    for (int i = 0; i < QUEUE_MAX; i++) {
       if (!P.queue[i].used) {
          P.queue[i].index = index;
@@ -211,13 +233,21 @@ void player_release_hardware(void)
 {
    if (P.state == PLAYER_IDLE) return;
    WHBLogPrintf("[player] soltando hardware (perdimos el foreground)");
-   // Orden importante: primero los recursos de hardware, mientras todavía
-   // se nos permite tocarlos; la memoria y el hilo de red van después.
-   decoder_close();
-   aac_decoder_close();
-   audio_out_shutdown();
+
+   // SOLO el hardware, y nada más. Este callback lo llama ProcUI y tiene que
+   // volver deprisa: liberar memoria, parar hilos o esperar a la GPU aquí
+   // deja la consola colgada. La memoria se recupera al reproducir de nuevo
+   // o al cerrar la app.
+   decoder_close();        // devuelve el decodificador H264
+   aac_decoder_close();    // software, inmediato
+   audio_out_shutdown();   // devuelve las voces AX
    P.haveAudio = FALSE;
-   player_stop_internal(FALSE);
+
+   // Detener la reproducción sin desmontar nada: el vídeo no puede continuar
+   // sin decodificador.
+   P.state = PLAYER_ENDED;
+   P.queued = 0;
+   memset(P.queue, 0, sizeof(P.queue));
 }
 
 BOOL player_play_url(const char *url)
@@ -323,6 +353,7 @@ static BOOL try_open_media(void)
    P.nextAudioSample = 0;
    P.fbIndex = 0;
    P.audioDrained = FALSE;
+   P.rebuffering = FALSE;
    P.clockStart = OSGetSystemTime();
    P.state = PLAYER_PLAYING;
    WHBLogPrintf("[player] reproduciendo%s", P.haveAudio ? " con audio" : " (mudo)");
@@ -372,6 +403,23 @@ BOOL player_update(void)
    if (P.state == PLAYER_PAUSED) return P.framesShown > 0;
    if (P.state != PLAYER_PLAYING) return FALSE;
 
+   // Si estamos rellenando, no se reproduce hasta tener margen suficiente.
+   if (P.rebuffering) {
+      uint64_t needFrom = (P.nextSample < P.vid.sampleCount)
+                             ? P.vid.samples[P.nextSample].offset : 0;
+      BOOL enough = fetch_available(needFrom) >= REBUFFER_BYTES ||
+                    fetch_state() == FETCH_DONE;
+      if (!enough) return P.framesShown > 0;   // sigue congelado el último frame
+
+      // Reanudar donde se paró: el reloj de audio no avanzó mientras tanto.
+      P.rebuffering = FALSE;
+      P.audioDrained = FALSE;
+      P.clockStart = OSGetSystemTime() -
+                     (OSTime)(P.rebufferClock * (double)OSTimerClockSpeed);
+      audio_out_pause(FALSE);
+      WHBLogPrintf("[player] reanudando en %.1fs", P.rebufferClock);
+   }
+
    feed_audio();
 
    // Reloj maestro: si hay audio, manda él. Un salto de audio se oye; un
@@ -397,7 +445,9 @@ BOOL player_update(void)
    }
 
    // Alimentar el decoder con lo que ya esté descargado
-   while (P.queued < VIDEO_NUM_BUFFERS - 1 && P.nextSample < P.vid.sampleCount) {
+   // Profundidad de tubería: con margen el decodificado absorbe los picos
+   // (fotogramas clave grandes) sin que la presentación se quede seca.
+   while (P.queued < 3 && P.nextSample < P.vid.sampleCount) {
       if (!sample_available(&P.vid.samples[P.nextSample])) break;  // esperando red
 
       Mp4Sample *s = &P.vid.samples[P.nextSample];
@@ -413,7 +463,7 @@ BOOL player_update(void)
       if (conv == 0) { P.nextSample++; continue; }
 
       decoder_submit(P.bitstream, len + conv, s->pts,
-                     video_renderer_framebuffer(P.fbIndex), P.fbIndex);
+                     video_renderer_framebuffer(P.fbIndex));
       P.fbIndex = (P.fbIndex + 1) % VIDEO_NUM_BUFFERS;
       P.nextSample++;
    }
@@ -433,12 +483,39 @@ BOOL player_update(void)
 
    release_consumed();
 
+   // ¿Nos hemos quedado sin datos? Parar y acumular en vez de dar tirones.
+   if (!P.rebuffering && P.nextSample < P.vid.sampleCount &&
+       fetch_state() != FETCH_DONE &&
+       !sample_available(&P.vid.samples[P.nextSample]) && P.queued == 0) {
+      P.rebuffering = TRUE;
+      P.rebufferClock = clock;
+      audio_out_pause(TRUE);
+      WHBLogPrintf("[player] rebuffering en %.1fs (la red no da para el bitrate)", clock);
+      return P.framesShown > 0;
+   }
+
    double pts;
    int due = take_due_frame(clock, &pts);
    if (due >= 0) {
       video_renderer_submit(due);
       P.framesShown++;
+      P.fpsFrames++;
       P.lastPts = pts;
+
+      for (int i = 9; i > 0; i--) P.lastShown[i] = P.lastShown[i - 1];
+      P.lastShown[0] = pts;
+      if (P.lastShownCount < 10) P.lastShownCount++;
+   }
+
+   // Ventana de 1 s para la cadencia observada
+   if (P.fpsWindow == 0) P.fpsWindow = OSGetSystemTime();
+   {
+      double win = OSTicksToMicroseconds(OSGetSystemTime() - P.fpsWindow) / 1e6;
+      if (win >= 1.0) {
+         P.fpsValue = P.fpsFrames / win;
+         P.fpsFrames = 0;
+         P.fpsWindow = OSGetSystemTime();
+      }
    }
 
    return P.framesShown > 0;
@@ -451,6 +528,17 @@ double player_duration(void)        { return P.haveVid ? P.vid.duration : 0.0; }
 uint32_t player_frames_shown(void)  { return P.framesShown; }
 
 double player_mbps(void) { return fetch_mbps(); }
+BOOL player_is_rebuffering(void) { return P.rebuffering; }
+double player_fps(void) { return P.fpsValue; }
+
+// Rellena `out` con los PTS de los últimos fotogramas mostrados, del más
+// reciente al más antiguo. Devuelve cuántos.
+int player_recent_pts(double *out, int max)
+{
+   int n = P.lastShownCount < max ? P.lastShownCount : max;
+   for (int i = 0; i < n; i++) out[i] = P.lastShown[i];
+   return n;
+}
 
 int player_progress_pct(void)
 {
