@@ -36,4 +36,10 @@ typedef struct {
 
 // 0 = ok; <0 = error (mensaje en errbuf)
 int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen);
+
+// Igual pero sobre un prefijo del archivo ya en memoria (reproducción durante
+// la descarga). Exige que el moov esté al principio: `-movflags +faststart`.
+int mp4_parse_memory(const uint8_t *data, uint32_t len, Mp4Video *out,
+                     char *errbuf, size_t errlen);
+
 void mp4_free(Mp4Video *v);

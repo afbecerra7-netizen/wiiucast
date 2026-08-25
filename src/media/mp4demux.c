@@ -423,6 +423,74 @@ int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen)
    return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Variante sobre memoria: para reproducir mientras se descarga. `data` es el
+// principio del archivo y `len` lo que se lleva descargado, así que el moov
+// tiene que estar dentro de ese prefijo (MP4 con `-movflags +faststart`).
+// ---------------------------------------------------------------------------
+int mp4_parse_memory(const uint8_t *data, uint32_t len, Mp4Video *out,
+                     char *errbuf, size_t errlen)
+{
+   memset(out, 0, sizeof(*out));
+   if (!data || len < 16) { ERR("aun no hay datos suficientes"); return -1; }
+
+   const uint8_t *moov = NULL;
+   size_t moovLen = 0;
+   uint32_t pos = 0;
+   int sawTruncatedMoov = 0;
+
+   while (pos + 8 <= len) {
+      uint64_t boxSize = be32(data + pos);
+      uint32_t boxType = be32(data + pos + 4);
+      uint32_t hdrSize = 8;
+
+      if (boxSize == 1) {
+         if (pos + 16 > len) break;
+         boxSize = be64(data + pos + 8);
+         hdrSize = 16;
+      } else if (boxSize == 0) {
+         boxSize = len - pos;   // "hasta el final"
+      }
+      if (boxSize < hdrSize) break;
+
+      if (boxType == FOURCC('m','o','o','v')) {
+         if (pos + boxSize > len) { sawTruncatedMoov = 1; break; }  // aún llegando
+         moov = data + pos + hdrSize;
+         moovLen = (size_t)(boxSize - hdrSize);
+         break;
+      }
+
+      if (boxSize > len - pos) break;   // box que se extiende más allá de lo bajado
+      pos += (uint32_t)boxSize;
+   }
+
+   if (!moov) {
+      if (sawTruncatedMoov) ERR("descargando el indice del video...");
+      else ERR("indice no encontrado al principio: reencodea con -movflags +faststart");
+      return -1;
+   }
+
+   const uint8_t *iter = NULL;
+   size_t trakLen;
+   const uint8_t *trak;
+   int found = 0;
+   char lastErr[128] = "sin trak de video H.264";
+
+   while ((trak = next_box_of(moov, moovLen, FOURCC('t','r','a','k'), &trakLen, &iter)) != NULL) {
+      char tErr[128] = "";
+      int rc = parse_trak(trak, trakLen, out, tErr, sizeof(tErr));
+      if (rc == 0) { found = 1; break; }
+      if (rc < 0) {
+         snprintf(lastErr, sizeof(lastErr), "%s", tErr);
+         mp4_free(out);
+         memset(out, 0, sizeof(*out));
+      }
+   }
+
+   if (!found) { ERR("%s", lastErr); return -1; }
+   return 0;
+}
+
 void mp4_free(Mp4Video *v)
 {
    free(v->samples);

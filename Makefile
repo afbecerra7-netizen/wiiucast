@@ -16,7 +16,7 @@ include $(DEVKITPRO)/wut/share/wut_rules
 
 TARGET		:=	wiiucast
 BUILD		:=	build
-SOURCES		:=	src src/net src/ui
+SOURCES		:=	src src/net src/ui src/video src/media
 DATA		:=	data
 INCLUDES	:=	src
 CONTENT		:=
