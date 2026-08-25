@@ -178,9 +178,43 @@ uint32_t audio_out_write(const int16_t *interleaved, uint32_t frames)
    }
    s_writePos = (s_writePos + frames) % RING_FRAMES;
    s_written += frames;
+
+   // Guarda de silencio por delante: la voz reproduce el anillo EN BUCLE, así
+   // que si el decodificador se retrasa el hardware volvería a soltar audio
+   // viejo. Dejando ceros justo detrás de lo escrito, un adelanto se oye como
+   // silencio en vez de como un eco.
+   {
+      uint32_t guard = 2048;
+      if (guard > RING_FRAMES / 4) guard = RING_FRAMES / 4;
+      for (int c = 0; c < s_channels; c++) {
+         uint32_t start = s_writePos;
+         uint32_t first = RING_FRAMES - start;
+         if (guard <= first) {
+            memset(&s_ring[c][start], 0, guard * sizeof(int16_t));
+            DCFlushRange(&s_ring[c][start], guard * sizeof(int16_t));
+         } else {
+            memset(&s_ring[c][start], 0, first * sizeof(int16_t));
+            memset(&s_ring[c][0], 0, (guard - first) * sizeof(int16_t));
+            DCFlushRange(&s_ring[c][start], first * sizeof(int16_t));
+            DCFlushRange(&s_ring[c][0], (guard - first) * sizeof(int16_t));
+         }
+      }
+   }
    OSUnlockMutex(&s_mutex);
 
    return frames;
+}
+
+void audio_out_stop(void)
+{
+   if (!s_ready) return;
+   for (int c = 0; c < s_channels; c++) {
+      if (!s_voice[c]) continue;
+      AXVoiceBegin(s_voice[c]);
+      AXSetVoiceState(s_voice[c], AX_VOICE_STATE_STOPPED);
+      AXVoiceEnd(s_voice[c]);
+   }
+   s_paused = TRUE;
 }
 
 uint64_t audio_out_played_frames(void)

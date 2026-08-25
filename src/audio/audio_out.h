@@ -32,4 +32,5 @@ double audio_out_clock(void);      // segundos reproducidos
 uint32_t audio_out_queued_frames(void);
 
 void audio_out_pause(BOOL paused);
+void audio_out_stop(void);         // parar las voces (fin del medio)
 void audio_out_reset(void);        // vaciar el anillo (stop / seek)

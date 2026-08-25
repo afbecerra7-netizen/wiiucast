@@ -38,6 +38,11 @@ static char s_url[512];
 static OSThread s_thread;
 static uint8_t *s_stack;
 static volatile BOOL s_stopRequested;
+// El hilo se bloquea dentro de recv() sin timeout. Para poder cerrarlo hay
+// que cerrarle el socket desde fuera: eso hace que recv vuelva y el hilo
+// salga. Sin esto, OSJoinThread no retorna nunca y la app se cuelga al salir
+// (dejando además la consola inservible para wiiload).
+static volatile int s_sock = -1;
 static OSMutex s_mutex;
 static BOOL s_mutexReady;
 
@@ -138,6 +143,7 @@ static int fetch_thread(int argc, const char **argv)
 
    int fd = socket(AF_INET, SOCK_STREAM, 0);
    if (fd < 0) { set_error("socket() fallo"); return 0; }
+   s_sock = fd;
 
    int one = 1;
    setsockopt(fd, SOL_SOCKET, SO_RUSRBUF, &one, sizeof(one));
@@ -146,7 +152,7 @@ static int fetch_thread(int argc, const char **argv)
 
    if (connect_timeout(fd, ip, port) != 0) {
       set_error("no se pudo conectar al servidor");
-      close(fd);
+      s_sock = -1; close(fd);
       return 0;
    }
 
@@ -161,7 +167,7 @@ static int fetch_thread(int argc, const char **argv)
                          path, host);
    if (send(fd, req, reqLen, 0) != reqLen) {
       set_error("fallo al enviar la peticion");
-      close(fd);
+      s_sock = -1; close(fd);
       return 0;
    }
 
@@ -180,7 +186,7 @@ static int fetch_thread(int argc, const char **argv)
       if (n < 0) {
          if (OSTicksToSeconds(OSGetSystemTime() - lastData) >= IDLE_TIMEOUT_S) {
             set_error("el servidor dejo de enviar datos");
-            close(fd);
+            s_sock = -1; close(fd);
             return 0;
          }
          OSSleepTicks(OSMillisecondsToTicks(5));
@@ -209,7 +215,7 @@ static int fetch_thread(int argc, const char **argv)
             char msg[128];
             snprintf(msg, sizeof(msg), "el servidor respondio %d", code);
             set_error(msg);
-            close(fd);
+            s_sock = -1; close(fd);
             return 0;
          }
 
@@ -238,6 +244,7 @@ static int fetch_thread(int argc, const char **argv)
       OSUnlockMutex(&s_mutex);
    }
 
+   s_sock = -1;
    close(fd);
    if (s_state == FETCH_STREAMING) {
       s_state = FETCH_DONE;
@@ -284,6 +291,15 @@ void fetch_stop(void)
 {
    if (s_state == FETCH_IDLE) return;
    s_stopRequested = TRUE;
+
+   // Desbloquear el recv() del hilo: sin esto OSJoinThread no vuelve nunca.
+   int fd = s_sock;
+   if (fd >= 0) {
+      s_sock = -1;
+      shutdown(fd, SHUT_RDWR);
+      close(fd);
+   }
+
    OSJoinThread(&s_thread, NULL);
    s_state = FETCH_IDLE;
    s_windowStart = s_filled = s_totalSize = 0;

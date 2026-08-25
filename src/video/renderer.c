@@ -5,6 +5,7 @@
 #include <whb/log.h>
 
 #include <gx2/draw.h>
+#include <gx2/event.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
 #include <gx2/sampler.h>
@@ -243,6 +244,9 @@ int video_renderer_height(void) { return s_height; }
 void video_renderer_shutdown(void)
 {
    if (!s_ready) return;
+   // Esperar a que la GPU termine antes de liberar texturas y shaders: si
+   // sigue leyendo memoria que acabamos de soltar, la salida se cuelga.
+   GX2DrawDone();
    free_frames();
    free(s_posBuf); s_posBuf = NULL;
    free(s_texBuf); s_texBuf = NULL;

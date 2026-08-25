@@ -412,6 +412,9 @@ BOOL player_update(void)
    if (P.nextSample >= P.vid.sampleCount && P.queued == 0) {
       decoder_flush();
       if (P.queued == 0) {
+         // Las voces AX reproducen el anillo en bucle: hay que pararlas o
+         // seguirían soltando el último trozo de audio indefinidamente.
+         audio_out_stop();
          P.state = PLAYER_ENDED;
          WHBLogPrintf("[player] fin: %u frames mostrados", P.framesShown);
          return P.framesShown > 0;
