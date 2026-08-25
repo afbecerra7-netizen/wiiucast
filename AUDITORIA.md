@@ -10,11 +10,13 @@
 
 **Las condiciones:** dos incógnitas que ninguna investigación puede resolver desde el escritorio y que **deben probarse en hardware real antes de escribir el producto** (Fase 0), más una restricción física de red que fuerza decisiones de producto.
 
-| # | Condición | Estado |
+> **ACTUALIZACIÓN 2026-08-24 — Fase 0 EJECUTADA en hardware real.** Resultados completos en [spikes/RESULTADOS.md](spikes/RESULTADOS.md). El GO condicional pasa a **GO**.
+
+| # | Condición | Estado tras Fase 0 |
 |---|---|---|
-| 1 | Recepción multicast SSDP (`239.255.255.250:1900`) en hardware real | **NO CONFIRMADO** — spike de una tarde |
-| 2 | Decode de archivos MP4/MKV *normales* (B-frames, AVCC) con H264DEC en modo buffered | **NO PROBADO** — todo el homebrew existente usa streams sin B-frames |
-| 3 | Wi-Fi de la consola: 2.4 GHz b/g/n, ~5–10 Mbps sostenidos vs. vídeos de teléfono de 10–40 Mbps | **RESTRICCIÓN FÍSICA** — decidir producto (720p, LAN adapter, o transcodificar en emisor) |
+| 1 | Recepción multicast SSDP (`239.255.255.250:1900`) en hardware real | ✅ **CONFIRMADA** — la consola recibe SSDP multicast, mDNS, broadcast y unicast por Wi-Fi. (Maña crítica descubierta: leer UDP con `len ≤ 1460` o nsysnet falla con EMSGSIZE; sin `SO_NONBLOCK`, patrón select+recvfrom) |
+| 2 | Decode de archivos MP4 *normales* (B-frames, AVCC) con H264DEC en modo buffered | ✅ **CONFIRMADA** — reordenado perfecto (0 PTS fuera de orden), 0 errores; avg 9.6 ms/frame a 720p30 (3.5×) y 21.0 ms a 1080p30 (1.6×). Techo: 720p60 y 1080p30 sí; 1080p60 no |
+| 3 | Wi-Fi de la consola: 2.4 GHz b/g/n vs. vídeos de teléfono de 10–40 Mbps | ⚠️ **PARCIAL** — medidos 1.8 Mbps sostenidos por Wi-Fi (límite de ventana TCP, no de radio). Palancas pendientes: `SO_RCVBUF` grande, descargas paralelas con Range, y adaptador LAN |
 
 ---
 

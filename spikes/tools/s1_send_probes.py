@@ -52,6 +52,7 @@ def main() -> None:
 
     probes = [
         ("TEST-unicast", wiiu_ip, SSDP_PORT, False),
+        ("TEST-uni-1901", wiiu_ip, 1901, False),   # socket de control sin join
         ("TEST-bcast-subred", subnet_broadcast(wiiu_ip), SSDP_PORT, True),
         ("TEST-bcast-255", "255.255.255.255", SSDP_PORT, True),
         ("TEST-multicast", SSDP_GROUP, SSDP_PORT, False),

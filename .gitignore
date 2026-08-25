@@ -4,3 +4,5 @@ build/
 *.rpx
 *.wuhb
 *.map
+sd-card/
+pc-server/

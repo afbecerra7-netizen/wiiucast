@@ -29,11 +29,14 @@
 
 #include <coreinit/time.h>
 #include <coreinit/thread.h>
+#include <nn/nets2/somemopt.h>
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 
 #include <errno.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -49,6 +52,50 @@
 
 static uint32_t g_myIp;  // para filtrar el loopback de nuestros propios envíos
 
+// ---------------------------------------------------------------------------
+// somemopt: donar 3 MiB al stack de red. Teoría bajo prueba: sin esta
+// donación, la copia de datagramas UDP hacia el usuario falla con el error
+// nativo 12 (EMSGSIZE) — moonlight/RetroArch/ftpd (que sí reciben UDP en
+// hardware) la hacen todos. La llamada INIT bloquea hasta el apagado de
+// nsysnet, por eso vive en su propio hilo y el buffer no se libera jamás.
+// ---------------------------------------------------------------------------
+static OSThread s_memThread;
+static void *s_memBuf;
+
+static int somemopt_thread(int argc, const char **argv)
+{
+   somemopt(SOMEMOPT_REQUEST_INIT, s_memBuf, 0x300000, SOMEMOPT_FLAGS_NONE);
+   return 0;
+}
+
+static void thread_dealloc(OSThread *t, void *stack) { free(stack); }
+
+static void net_memory_init(void)
+{
+   s_memBuf = memalign(0x40, 0x300000);
+   if (!s_memBuf) {
+      WHBLogPrintf("[mem] sin memoria para somemopt");
+      return;
+   }
+   const int stackSize = 128 * 1024;
+   uint8_t *stack = memalign(16, stackSize);
+   if (!stack) { free(s_memBuf); s_memBuf = NULL; return; }
+
+   if (!OSCreateThread(&s_memThread, somemopt_thread, 0, NULL,
+                       stack + stackSize, stackSize, 16,
+                       OS_THREAD_ATTRIB_AFFINITY_ANY | OS_THREAD_ATTRIB_DETACHED)) {
+      free(stack); free(s_memBuf); s_memBuf = NULL;
+      WHBLogPrintf("[mem] OSCreateThread fallo");
+      return;
+   }
+   OSSetThreadName(&s_memThread, "somemopt");
+   OSSetThreadDeallocator(&s_memThread, thread_dealloc);
+   OSResumeThread(&s_memThread);
+
+   int rc = somemopt(SOMEMOPT_REQUEST_WAIT_FOR_INIT, NULL, 0, SOMEMOPT_FLAGS_NONE);
+   WHBLogPrintf("[mem] somemopt 3 MiB donados (wait rc=%d)", rc);
+}
+
 typedef struct {
    const char *name;
    int fd;
@@ -60,6 +107,7 @@ typedef struct {
    uint32_t msearch;  // M-SEARCH de otras máquinas
    uint32_t replies;  // respuestas HTTP/1.1 200 (renderers contestando)
    uint32_t self;     // loopback de la propia consola (no cuenta)
+   uint32_t rxErrLogged;  // errores de recvfrom ya logueados (cap)
 } Listener;
 
 static void ip4_str(uint32_t ip, char *out /* >= 16 */)
@@ -128,43 +176,102 @@ static int listener_open(Listener *l)
       return -1;
    }
 
-   struct ip_mreq mreq;
-   mreq.imr_multiaddr.s_addr = l->group;
-   mreq.imr_interface.s_addr = INADDR_ANY;
+   if (l->group) {
+      struct ip_mreq mreq;
+      mreq.imr_multiaddr.s_addr = l->group;
+      mreq.imr_interface.s_addr = INADDR_ANY;
 
-   // ============ LA LLAMADA QUE ESTE SPIKE EXISTE PARA PROBAR ============
-   int rc = setsockopt(l->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-   l->joined = rc;
-   l->joinErrno = (rc == 0) ? 0 : errno;
+      // ============ LA LLAMADA QUE ESTE SPIKE EXISTE PARA PROBAR ============
+      int rc = setsockopt(l->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
+      l->joined = rc;
+      l->joinErrno = (rc == 0) ? 0 : errno;
 
-   char g[16];
-   ip4_str(l->group, g);
-   WHBLogPrintf("[%s] join %s:%u -> rc=%d errno=%d %s",
-                l->name, g, l->port, rc, l->joinErrno,
-                (rc == 0) ? "(API OK; falta ver si llegan paquetes)" : "(JOIN RECHAZADO)");
-
-   // No bloqueante para poder sondear ambos sockets en el bucle principal.
-   // (Además recvfrom usa MSG_DONTWAIT por si este setsockopt fallara.)
-   if (setsockopt(l->fd, SOL_SOCKET, SO_NONBLOCK, &one, sizeof(one)) != 0) {
-      WHBLogPrintf("[%s] SO_NONBLOCK fallo: errno=%d", l->name, errno);
+      char g[16];
+      ip4_str(l->group, g);
+      WHBLogPrintf("[%s] join %s:%u -> rc=%d errno=%d %s",
+                   l->name, g, l->port, rc, l->joinErrno,
+                   (rc == 0) ? "(API OK; falta ver si llegan paquetes)" : "(JOIN RECHAZADO)");
+   } else {
+      WHBLogPrintf("[%s] escucha :%u sin join (control unicast puro)", l->name, l->port);
    }
 
+   // NADA de SO_NONBLOCK: en pruebas reales, recvfrom sobre un socket en ese
+   // modo devolvía siempre el error nativo 12 (EMSGSIZE) en nsysnet. El patrón
+   // probado (mdnsniff) es select() con timeout cero + recvfrom bloqueante.
+   int rusr = 1;
+   int rurc = setsockopt(l->fd, SOL_SOCKET, SO_RUSRBUF, &rusr, sizeof(rusr));
+   int rcvbuf = 65536;
+   int rbrc = setsockopt(l->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+   WHBLogPrintf("[%s] SO_RUSRBUF rc=%d(e%d) SO_RCVBUF rc=%d(e%d)",
+                l->name, rurc, rurc ? errno : 0, rbrc, rbrc ? errno : 0);
+
    return 0;
+}
+
+// ¿Hay datos en cola? (select con timeout cero)
+static int sock_ready(int fd)
+{
+   fd_set readfds;
+   FD_ZERO(&readfds);
+   FD_SET(fd, &readfds);
+   struct timeval tv = { 0, 0 };
+   return select(fd + 1, &readfds, NULL, NULL, &tv) > 0;
 }
 
 static void listener_poll(Listener *l)
 {
    if (l->fd < 0) return;
 
-   char buf[1500];
+   // Buffer alineado a 64 (0x40): el IPC de nsysnet hacia IOSU es sensible a
+   // la alineación del buffer de recepción (patrón tomado de mdnsniff).
+   static __attribute__((aligned(64))) char buf[2048];
    struct sockaddr_in src;
 
-   for (;;) {
-      socklen_t slen = sizeof(src);
-      ssize_t n = recvfrom(l->fd, buf, sizeof(buf) - 1, MSG_DONTWAIT,
-                           (struct sockaddr *)&src, &slen);
-      if (n <= 0) {
-         break;  // EWOULDBLOCK o error transitorio: volvemos al bucle principal
+   // MATRIZ DE LONGITUDES: los tres métodos (recvfrom±addr, recv) fallan
+   // igual con err 12 y el datagrama NO se consume. Teoría: InterNiche
+   // devuelve EMSGSIZE si la longitud pedida excede el buffer de recepción
+   // del socket. Se prueba en cascada 2047 -> 1460 -> 1024 -> 256; la
+   // longitud que funcione (junto al estado de somemopt) delata la causa.
+   static const int TRY_LENS[4] = { 2047, 1460, 1024, 256 };
+
+   for (int i = 0; i < 32; i++) {
+      if (!sock_ready(l->fd)) break;
+
+      ssize_t n = -1;
+      int usedLen = 0;
+      int errs[4] = { 0, 0, 0, 0 };
+      int consumed = 0;
+
+      for (int k = 0; k < 4; k++) {
+         if (k > 0 && !sock_ready(l->fd)) { consumed = 1; break; }
+         memset(&src, 0, sizeof(src));
+         socklen_t slen = sizeof(src);
+         n = recvfrom(l->fd, buf, TRY_LENS[k], 0,
+                      (struct sockaddr *)&src, &slen);
+         if (n >= 0) { usedLen = TRY_LENS[k]; break; }
+         errs[k] = errno;
+      }
+
+      if (n < 0) {
+         if (l->rxErrLogged < 4) {
+            l->rxErrLogged++;
+            if (consumed) {
+               WHBLogPrintf("[%s] !! e=%d,%d,%d,%d (datagrama consumido)",
+                            l->name, errs[0], errs[1], errs[2], errs[3]);
+            } else {
+               WHBLogPrintf("[%s] !! len2047=%d len1460=%d len1024=%d len256=%d",
+                            l->name, errs[0], errs[1], errs[2], errs[3]);
+            }
+         }
+         break;
+      }
+
+      if (n == 0) break;
+
+      // Primer paquete OK: decir qué longitud funcionó (esto delata la causa)
+      if (l->packets + l->self == 0) {
+         WHBLogPrintf("[%s] >> RX OK con len=%d (errnos previos: %d,%d,%d)",
+                      l->name, usedLen, errs[0], errs[1], errs[2]);
       }
 
       buf[n] = '\0';
@@ -235,6 +342,8 @@ int main(int argc, char **argv)
 
    WHBLogPrintf("== WiiU Cast S1: multicast RX (SSDP vs mDNS) ==");
 
+   net_memory_init();
+
    g_myIp = local_ip();
    char ipstr[16];
    ip4_str(g_myIp, ipstr);
@@ -245,8 +354,10 @@ int main(int argc, char **argv)
 
    Listener ssdp = { .name = "SSDP", .fd = -1, .group = SSDP_GROUP, .port = SSDP_PORT };
    Listener mdns = { .name = "mDNS", .fd = -1, .group = MDNS_GROUP, .port = MDNS_PORT };
+   Listener uni  = { .name = "UNI",  .fd = -1, .group = 0,          .port = 1901 };
    listener_open(&ssdp);
    listener_open(&mdns);
+   listener_open(&uni);
 
    send_msearch(ssdp.fd);
 
@@ -255,12 +366,14 @@ int main(int argc, char **argv)
    while (WHBProcIsRunning()) {
       listener_poll(&ssdp);
       listener_poll(&mdns);
+      listener_poll(&uni);
 
       OSTime now = OSGetSystemTime();
       if (OSTicksToSeconds(now - lastBeat) >= 5) {
          lastBeat = now;
-         WHBLogPrintf("vivo | SSDP: %u pkts (%u M-SEARCH, %u resp, %u self) | mDNS: %u pkts",
-                      ssdp.packets, ssdp.msearch, ssdp.replies, ssdp.self, mdns.packets);
+         WHBLogPrintf("vivo | SSDP: %u (%u MS, %u resp, %u self) | mDNS: %u | UNI:1901: %u",
+                      ssdp.packets, ssdp.msearch, ssdp.replies, ssdp.self,
+                      mdns.packets, uni.packets);
       }
 
       WHBLogConsoleDraw();
@@ -272,7 +385,8 @@ int main(int argc, char **argv)
    WHBLogPrintf("== RESULTADO S1 ==");
    WHBLogPrintf("SSDP join rc=%d | pkts=%u | M-SEARCH=%u | resp=%u | self=%u",
                 ssdp.joined, ssdp.packets, ssdp.msearch, ssdp.replies, ssdp.self);
-   WHBLogPrintf("mDNS join rc=%d | pkts=%u", mdns.joined, mdns.packets);
+   WHBLogPrintf("mDNS join rc=%d | pkts=%u | UNI:1901 pkts=%u",
+                mdns.joined, mdns.packets, uni.packets);
    if (ssdp.msearch > 0) {
       WHBLogPrintf("C1 CONFIRMADA: la consola recibe M-SEARCH del grupo SSDP.");
    } else if (ssdp.packets > 0) {
@@ -287,6 +401,7 @@ int main(int argc, char **argv)
 
    if (ssdp.fd >= 0) close(ssdp.fd);
    if (mdns.fd >= 0) close(mdns.fd);
+   if (uni.fd >= 0) close(uni.fd);
 
    WHBLogConsoleFree();
    WHBProcShutdown();
