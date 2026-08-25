@@ -1,12 +1,13 @@
 // ============================================================================
 // WiiU Cast — receptor de medios local para Wii U (Aroma)
 //
-// Fase 1: esqueleto. La consola levanta un servidor HTTP, sirve una web UI al
-// teléfono y acepta URLs de medios. La reproducción llega en la Fase 2 (el
-// pipeline ya está validado en spikes/s2-decode).
+// La consola sirve una web UI al teléfono, recibe una URL y reproduce el
+// vídeo en la TV y el GamePad.
 //
-// Estado del arte de sockets en esta consola: ver spikes/RESULTADOS.md — las
-// reglas de nsysnet que hacen que esto funcione no son las de BSD.
+// GX2 es dueño ÚNICO de la pantalla: la UI de texto se dibuja dentro de un
+// frame NV12 (texto en el plano Y, UV neutro) y sale por el mismo shader que
+// el vídeo. Alternar con OSScreen dejaba la TV en negro — las dos APIs se
+// disputaban los scan buffers y el frame heap de MEM1.
 // ============================================================================
 
 #include <whb/proc.h>
@@ -22,23 +23,24 @@
 
 #include "media/player.h"
 #include "net/http_server.h"
-#include "ui/screen.h"
+#include "ui/overlay.h"
 #include "video/renderer.h"
 #include "web/index.h"
 
 #define HTTP_PORT 8080
-#define BG        0x101820FF   // fondo de la UI de consola (RGBX8 big-endian)
 
-// OSScreen (la UI de texto) y GX2 (el vídeo) no pueden poseer la pantalla a
-// la vez: se alterna entre los dos según haya reproducción o no.
-typedef enum { DISPLAY_UI = 0, DISPLAY_VIDEO } DisplayMode;
+// Lienzo de la UI. 854x480 es la resolución nativa del GamePad y escala
+// limpio a la TV; de paso el frame es pequeño y barato de redibujar.
+#define UI_W 854
+#define UI_H 480
 
 static struct {
    char url[512];
    uint32_t casts;
-   DisplayMode display;
-   char notice[160];      // último error del reproductor, para la web UI
-   OSTime lastEvent;
+   char notice[160];
+   uint32_t ip;
+   BOOL uiDirty;          // hay que redibujar el lienzo de la UI
+   PlayerState lastState;
 } g_app;
 
 static const char *state_name(void)
@@ -53,38 +55,9 @@ static const char *state_name(void)
    }
 }
 
-// Cambia entre la UI de texto (OSScreen) y el vídeo (GX2). Cada API reclama
-// los scan buffers, así que hay que apagar una antes de encender la otra.
-// Lo llama el reproductor (via player_set_display_cb) justo cuando necesita
-// la salida de vídeo lista, no el bucle principal: si se hiciera al revés,
-// las texturas se crearían antes de que GX2 existiera.
-static BOOL set_display(BOOL wantVideo)
-{
-   DisplayMode mode = wantVideo ? DISPLAY_VIDEO : DISPLAY_UI;
-   if (g_app.display == mode) return TRUE;
-
-   WHBLogPrintf("[display] cambiando a %s", wantVideo ? "VIDEO" : "UI");
-
-   if (mode == DISPLAY_VIDEO) {
-      screen_shutdown();
-      if (!video_renderer_init()) {
-         WHBLogPrintf("[display] GX2 fallo; vuelvo a la UI");
-         screen_init();
-         return FALSE;
-      }
-   } else {
-      video_renderer_shutdown();
-      screen_init();
-   }
-   g_app.display = mode;
-   return TRUE;
-}
-
 // ---------------------------------------------------------------------------
 // Rutas HTTP
 // ---------------------------------------------------------------------------
-
-// Escapa lo mínimo para meter una cadena dentro de un string JSON.
 static void json_escape(const char *in, char *out, uint32_t cap)
 {
    uint32_t o = 0;
@@ -101,14 +74,12 @@ static int handle_request(const char *method, const char *path, const char *quer
                           const char *body, char *out, uint32_t outCap,
                           const char **contentType)
 {
-   // --- Página principal
    if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
       *contentType = "text/html; charset=utf-8";
       snprintf(out, outCap, "%s", WEBUI_HTML);
       return 200;
    }
 
-   // --- Estado (lo consulta la web UI cada 2 s)
    if (strcmp(path, "/status") == 0) {
       *contentType = "application/json";
       char escUrl[600], escNote[300];
@@ -124,7 +95,6 @@ static int handle_request(const char *method, const char *path, const char *quer
       return 200;
    }
 
-   // --- Recibir una URL para reproducir
    if (strcmp(path, "/cast") == 0) {
       *contentType = "text/plain";
 
@@ -132,11 +102,8 @@ static int handle_request(const char *method, const char *path, const char *quer
          snprintf(out, outCap, "Falta la URL.");
          return 400;
       }
-      // Validación temprana: mejor un mensaje claro en el teléfono que un
-      // fallo silencioso cuando llegue el reproductor.
       if (strncmp(body, "https://", 8) == 0) {
-         snprintf(out, outCap,
-                  "HTTPS todavia no: la consola no hace TLS. Usa http://");
+         snprintf(out, outCap, "HTTPS todavia no: la consola no hace TLS. Usa http://");
          return 400;
       }
       if (strncmp(body, "http://", 7) != 0) {
@@ -147,10 +114,11 @@ static int handle_request(const char *method, const char *path, const char *quer
          snprintf(out, outCap, "URL demasiado larga.");
          return 400;
       }
+
       snprintf(g_app.url, sizeof(g_app.url), "%s", body);
       g_app.casts++;
-      g_app.lastEvent = OSGetSystemTime();
       g_app.notice[0] = '\0';
+      g_app.uiDirty = TRUE;
       WHBLogPrintf("[cast] %s", g_app.url);
 
       if (!player_play_url(g_app.url)) {
@@ -161,7 +129,6 @@ static int handle_request(const char *method, const char *path, const char *quer
       return 200;
    }
 
-   // --- Comandos de reproducción
    if (strcmp(path, "/cmd") == 0) {
       const char *a = strstr(query, "a=");
       *contentType = "text/plain";
@@ -178,7 +145,7 @@ static int handle_request(const char *method, const char *path, const char *quer
          snprintf(out, outCap, "comando desconocido");
          return 400;
       }
-      g_app.lastEvent = OSGetSystemTime();
+      g_app.uiDirty = TRUE;
       snprintf(out, outCap, "ok");
       return 200;
    }
@@ -189,57 +156,63 @@ static int handle_request(const char *method, const char *path, const char *quer
 }
 
 // ---------------------------------------------------------------------------
-// UI de la consola
+// Pantalla de estado, pintada como si fuera un frame de vídeo
 // ---------------------------------------------------------------------------
-static void render(uint32_t ip)
+static void draw_ui_frame(void)
 {
-   if (!screen_has_foreground()) return;
+   uint8_t *fb = video_renderer_framebuffer(0);
+   if (!fb) return;
+
+   int pitch = VIDEO_FRAME_PITCH(UI_W);
+   overlay_clear(fb, UI_W, UI_H, pitch, 24);   // fondo gris muy oscuro
+
+   overlay_text(fb, UI_W, UI_H, pitch, 40, 40, 2, "WiiU Cast");
+   overlay_text(fb, UI_W, UI_H, pitch, 40, 92, 1, "Receptor de medios local");
 
    char ipstr[16];
-   net_ip_str(ip, ipstr);
-
-   screen_begin(BG);
-
-   screen_text(SCREEN_TARGET_BOTH, 2, 1, "WiiU Cast");
-   screen_text(SCREEN_TARGET_BOTH, 2, 2, "Receptor de medios local");
-
-   if (ip) {
-      screen_textf(SCREEN_TARGET_BOTH, 2, 4, "Abre en el telefono:  http://%s:%u",
-                   ipstr, http_server_port());
+   net_ip_str(g_app.ip, ipstr);
+   if (g_app.ip) {
+      overlay_text(fb, UI_W, UI_H, pitch, 40, 150, 1, "Abre en el telefono:");
+      overlay_textf(fb, UI_W, UI_H, pitch, 40, 180, 1, "http://%s:%u",
+                    ipstr, http_server_port());
    } else {
-      screen_text(SCREEN_TARGET_BOTH, 2, 4, "Sin red: revisa la conexion de la consola");
+      overlay_text(fb, UI_W, UI_H, pitch, 40, 150, 1,
+                   "Sin red: revisa la conexion de la consola");
    }
 
-   screen_textf(SCREEN_TARGET_BOTH, 2, 6, "Estado:    %s", state_name());
-   if (g_app.url[0]) {
-      // La URL puede ser más larga que la rejilla del GamePad: se corta el
-      // primer tramo para ambas pantallas y el resto va solo a la TV.
-      #define URL_CHUNK 40
-      char chunk[URL_CHUNK + 1];
-      size_t urlLen = strlen(g_app.url);
-      size_t first = (urlLen < URL_CHUNK) ? urlLen : URL_CHUNK;
-      memcpy(chunk, g_app.url, first);
-      chunk[first] = '\0';
-      screen_textf(SCREEN_TARGET_BOTH, 2, 7, "Medio:     %s", chunk);
-      if (urlLen > first) {
-         screen_text(SCREEN_TARGET_TV, 13, 8, g_app.url + first);
-      }
-      #undef URL_CHUNK
-   }
+   overlay_textf(fb, UI_W, UI_H, pitch, 40, 250, 1, "Estado: %s", state_name());
 
-   if (player_state() == PLAYER_FAILED) {
-      screen_textf(SCREEN_TARGET_BOTH, 2, 9, "Fallo: %s", player_error());
-   } else if (player_state() == PLAYER_BUFFERING) {
+   PlayerState ps = player_state();
+   if (ps == PLAYER_FAILED) {
+      overlay_textf(fb, UI_W, UI_H, pitch, 40, 280, 1, "%s", player_error());
+   } else if (ps == PLAYER_BUFFERING) {
       int pct = player_progress_pct();
-      if (pct >= 0) screen_textf(SCREEN_TARGET_BOTH, 2, 9, "Descargado: %d%%", pct);
+      if (pct >= 0) {
+         overlay_textf(fb, UI_W, UI_H, pitch, 40, 280, 1, "Descargado: %d%%", pct);
+      }
+   } else if (g_app.url[0]) {
+      // La URL puede no caber en una línea: se corta a lo que entra.
+      overlay_textf(fb, UI_W, UI_H, pitch, 40, 280, 1, "%.55s", g_app.url);
    }
 
-   screen_textf(SCREEN_TARGET_BOTH, 2, 11, "Peticiones: %u   Casts: %u",
-                http_server_requests(), g_app.casts);
+   overlay_textf(fb, UI_W, UI_H, pitch, 40, 400, 1,
+                 "Peticiones: %u   Casts: %u", http_server_requests(), g_app.casts);
+   overlay_text(fb, UI_W, UI_H, pitch, 40, 430, 1, "HOME para salir");
 
-   screen_text(SCREEN_TARGET_BOTH, 2, 13, "HOME para salir");
+   video_renderer_submit(0);
+}
 
-   screen_present();
+// El reproductor pide la pantalla para el vídeo: se reconfiguran las texturas
+// a la resolución del medio. Al soltarla, se vuelve al lienzo de la UI.
+static BOOL on_display_request(BOOL wantVideo)
+{
+   if (!wantVideo) {
+      if (!video_renderer_set_size(UI_W, UI_H)) return FALSE;
+      g_app.uiDirty = TRUE;
+   }
+   // Para vídeo no hace falta nada aquí: el player llama a
+   // video_renderer_set_size() con la resolución real justo después.
+   return TRUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,74 +222,56 @@ int main(int argc, char **argv)
    WHBLogUdpInit();
    WHBInitCrashHandler();
 
-   screen_init();
+   WHBLogPrintf("== WiiU Cast ==");
 
-   // Traza de arranque EN PANTALLA: el log por UDP no llega fuera de la
-   // consola en esta red, así que cada paso se dibuja y se presenta. Si algo
-   // se cuelga, el último renglón visible dice exactamente dónde.
-   #define BOOT_STEP(row, txt)                          \
-      do {                                              \
-         screen_begin(BG);                              \
-         screen_text(SCREEN_TARGET_BOTH, 2, 1, "WiiU Cast — arrancando");  \
-         for (int _r = 0; _r <= (row); _r++)            \
-            screen_text(SCREEN_TARGET_BOTH, 2, 3 + _r, s_bootLog[_r]);     \
-         screen_present();                              \
-         WHBLogPrintf("[boot] %s", txt);                \
-      } while (0)
-
-   static const char *s_bootLog[8];
-   s_bootLog[0] = "1/6 proc + screen  OK";
-   BOOT_STEP(0, "proc+screen");
+   if (!video_renderer_init()) {
+      WHBLogPrintf("[main] GX2 no arranco; sin salida de video");
+      WHBProcShutdown();
+      return 1;
+   }
+   video_renderer_set_size(UI_W, UI_H);
 
    net_memory_init();
-   s_bootLog[1] = "2/6 somemopt       OK";
-   BOOT_STEP(1, "somemopt");
-
-   uint32_t ip = net_local_ip();
-   s_bootLog[2] = "3/6 ip local       OK";
-   BOOT_STEP(2, "ip");
+   g_app.ip = net_local_ip();
 
    if (!http_server_start(HTTP_PORT, handle_request)) {
-      s_bootLog[3] = "4/6 http server    FALLO";
-   } else {
-      s_bootLog[3] = "4/6 http server    OK";
+      WHBLogPrintf("[main] no se pudo levantar el servidor HTTP");
    }
-   BOOT_STEP(3, "http");
 
    player_init();
-   player_set_display_cb(set_display);   // después de init: init limpia el estado
-   s_bootLog[4] = "5/6 player         OK";
-   BOOT_STEP(4, "player");
+   player_set_display_cb(on_display_request);
 
-   s_bootLog[5] = "6/6 entrando al bucle";
-   BOOT_STEP(5, "loop");
-   g_app.display = DISPLAY_UI;
-   g_app.lastEvent = OSGetSystemTime();
+   g_app.uiDirty = TRUE;
+   g_app.lastState = PLAYER_IDLE;
 
    while (WHBProcIsRunning()) {
       http_server_poll();
 
-      player_update();
-
-      // Si la reproducción murió, devolver la pantalla a la UI de texto.
+      BOOL hasVideo = player_update();
       PlayerState ps = player_state();
-      if (g_app.display == DISPLAY_VIDEO && ps == PLAYER_FAILED) {
-         set_display(FALSE);
+
+      if (ps != g_app.lastState) {
+         g_app.lastState = ps;
+         g_app.uiDirty = TRUE;
       }
 
-      if (g_app.display == DISPLAY_VIDEO) {
+      if (hasVideo && (ps == PLAYER_PLAYING || ps == PLAYER_PAUSED)) {
+         // El vídeo ya está en las texturas: solo hay que presentarlo.
          video_renderer_draw(TRUE, 0.0f, 0.0f, 0.0f);
-         // GX2 ya sincroniza con el vsync: no hace falta dormir aquí.
       } else {
-         render(ip);
-         OSSleepTicks(OSMillisecondsToTicks(16));
+         // Pantalla de estado. Se redibuja solo cuando algo cambia; el resto
+         // de frames se limitan a re-presentar el mismo lienzo.
+         if (g_app.uiDirty) {
+            draw_ui_frame();
+            g_app.uiDirty = FALSE;
+         }
+         video_renderer_draw(TRUE, 0.0f, 0.0f, 0.0f);
       }
    }
 
    player_shutdown();
    http_server_stop();
-   if (g_app.display == DISPLAY_VIDEO) video_renderer_shutdown();
-   else screen_shutdown();
+   video_renderer_shutdown();
    WHBProcShutdown();
    return 0;
 }
