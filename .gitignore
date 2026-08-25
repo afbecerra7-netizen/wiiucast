@@ -6,3 +6,5 @@ build/
 *.map
 sd-card/
 pc-server/
+wiiucast.rpx
+wiiucast.wuhb
