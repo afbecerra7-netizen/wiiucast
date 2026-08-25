@@ -21,7 +21,7 @@
 
 // 8 MiB de colchón: a 6 Mbps son ~11 s de vídeo por delante, suficiente para
 // absorber el jitter del Wi-Fi de la consola.
-#define RING_SIZE     (8 * 1024 * 1024)
+#define RING_SIZE     (16 * 1024 * 1024)
 #define RECV_CHUNK    (32 * 1024)
 #define CONNECT_TIMEOUT_S 10
 #define IDLE_TIMEOUT_S    15
@@ -30,6 +30,8 @@ static uint8_t *s_ring;
 static uint64_t s_windowStart;   // offset del byte más antiguo aún en el ring
 static uint64_t s_filled;        // offset del siguiente byte a escribir
 static uint64_t s_totalSize;
+static OSTime s_firstByteTime;     // para medir la velocidad real
+static uint64_t s_bytesAtStart;
 
 static volatile FetchState s_state = FETCH_IDLE;
 static char s_error[128];
@@ -149,6 +151,13 @@ static int fetch_thread(int argc, const char **argv)
    setsockopt(fd, SOL_SOCKET, SO_RUSRBUF, &one, sizeof(one));
    setsockopt(fd, SOL_SOCKET, SO_WINSCALE, &one, sizeof(one));
    setsockopt(fd, SOL_SOCKET, SO_NOSLOWSTART, &one, sizeof(one));
+   // Buffer de recepción grande: el throughput lo limita ventana/RTT, y con
+   // el buffer por defecto la ventana se queda muy por debajo de la radio.
+   int rcvbuf = 512 * 1024;
+   if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
+      rcvbuf = 128 * 1024;   // si lo rechaza, probar algo más modesto
+      setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+   }
 
    if (connect_timeout(fd, ip, port) != 0) {
       set_error("no se pudo conectar al servidor");
@@ -234,6 +243,11 @@ static int fetch_thread(int argc, const char **argv)
       uint32_t payload = (uint32_t)n - dataOff;
       if (payload == 0) continue;
 
+      if (s_firstByteTime == 0) {
+         s_firstByteTime = OSGetSystemTime();
+         s_bytesAtStart = s_filled;
+      }
+
       if (!wait_for_space(payload)) break;
 
       OSLockMutex(&s_mutex);
@@ -271,6 +285,8 @@ BOOL fetch_start(const char *url)
 
    snprintf(s_url, sizeof(s_url), "%s", url);
    s_windowStart = s_filled = s_totalSize = 0;
+   s_firstByteTime = 0;
+   s_bytesAtStart = 0;
    s_error[0] = '\0';
    s_stopRequested = FALSE;
    s_state = FETCH_CONNECTING;
@@ -309,6 +325,14 @@ FetchState fetch_state(void)     { return s_state; }
 const char *fetch_error(void)    { return s_error; }
 uint64_t fetch_total_size(void)  { return s_totalSize; }
 uint64_t fetch_downloaded(void)  { return s_filled; }
+
+double fetch_mbps(void)
+{
+   if (s_firstByteTime == 0) return 0.0;
+   double secs = OSTicksToMicroseconds(OSGetSystemTime() - s_firstByteTime) / 1e6;
+   if (secs < 0.2) return 0.0;
+   return (double)(s_filled - s_bytesAtStart) * 8.0 / secs / 1e6;
+}
 
 uint32_t fetch_available(uint64_t offset)
 {

@@ -89,10 +89,10 @@ static int handle_request(const char *method, const char *path, const char *quer
                   escNote, sizeof(escNote));
       snprintf(out, outCap,
                "{\"state\":\"%s\",\"url\":\"%s\",\"casts\":%u,"
-               "\"pos\":%.1f,\"dur\":%.1f,\"dl\":%d,\"note\":\"%s\"}",
+               "\"pos\":%.1f,\"dur\":%.1f,\"dl\":%d,\"mbps\":%.2f,\"note\":\"%s\"}",
                state_name(), escUrl, g_app.casts,
                player_position(), player_duration(),
-               player_progress_pct(), escNote);
+               player_progress_pct(), player_mbps(), escNote);
       return 200;
    }
 

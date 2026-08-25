@@ -15,9 +15,9 @@
 #include <stdio.h>
 #include <string.h>
 
-// Cuánto hay que tener descargado antes de intentar parsear el MP4. El moov
-// de un archivo con faststart cabe de sobra en 1 MiB.
-#define HEADER_BYTES  (1024 * 1024)
+// Cuánto prefijo se copia para parsear el MP4. El moov de un archivo con
+// faststart cabe de sobra: el de un 1080p de 11 minutos ocupa ~360 KB.
+#define HEADER_PROBE  (4 * 1024 * 1024)
 
 // Frames decodificados esperando su turno de presentación.
 #define QUEUE_MAX 8
@@ -36,8 +36,11 @@ static struct {
    uint32_t nextAudioSample;
    uint8_t *audioSampleBuf;
 
-   uint8_t *fileBuf;      // copia local del archivo conforme llega
-   uint64_t fileCap, fileLen;
+   // El medio NO se guarda entero: se lee del buffer circular de red según
+   // hace falta, así que la memoria es constante sea cual sea el tamaño del
+   // archivo. Solo la cabecera (moov) se copia aparte para poder parsearla.
+   uint8_t *headerBuf;
+   uint32_t headerLen;
 
    uint8_t *bitstream, *sampleBuf;
    uint32_t bsCap;
@@ -122,20 +125,37 @@ static uint32_t avcc_to_annexb(const uint8_t *src, uint32_t srcLen,
    return (in == srcLen) ? out : 0;
 }
 
-// Copia lo que haya llegado por red al buffer local del archivo.
-static void drain_network(void)
+// Copia el prefijo del archivo (donde vive el moov) a un buffer propio, para
+// poder parsearlo aunque la ventana de red ya haya avanzado.
+static void drain_header(void)
 {
-   for (;;) {
-      uint32_t avail = fetch_available(P.fileLen);
-      if (avail == 0) return;
-      if (P.fileLen + avail > P.fileCap) avail = (uint32_t)(P.fileCap - P.fileLen);
-      if (avail == 0) return;   // buffer local lleno (archivo mayor del previsto)
+   if (!P.headerBuf || P.headerLen >= HEADER_PROBE) return;
+   uint32_t avail = fetch_available(P.headerLen);
+   if (avail == 0) return;
+   if (P.headerLen + avail > HEADER_PROBE) avail = HEADER_PROBE - P.headerLen;
+   int got = fetch_read(P.headerLen, P.headerBuf + P.headerLen, avail);
+   if (got > 0) P.headerLen += (uint32_t)got;
+}
 
-      int got = fetch_read(P.fileLen, P.fileBuf + P.fileLen, avail);
-      if (got <= 0) return;
-      P.fileLen += (uint32_t)got;
-      fetch_release_until(P.fileLen);
+// Libera del buffer circular todo lo anterior al primer byte que aún haga
+// falta. Vídeo y audio van entrelazados, así que manda el que va más atrás.
+static void release_consumed(void)
+{
+   uint64_t keep = UINT64_MAX;
+   if (P.haveVid && P.nextSample < P.vid.sampleCount) {
+      keep = P.vid.samples[P.nextSample].offset;
    }
+   if (P.haveAudio && P.nextAudioSample < P.aud.sampleCount) {
+      uint64_t a = P.aud.samples[P.nextAudioSample].offset;
+      if (a < keep) keep = a;
+   }
+   if (keep != UINT64_MAX) fetch_release_until(keep);
+}
+
+// ¿Está este sample entero dentro de la ventana descargada?
+static BOOL sample_available(const Mp4Sample *s)
+{
+   return fetch_available(s->offset) >= s->size;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +178,8 @@ static void free_playback(void)
    free(P.audioSampleBuf); P.audioSampleBuf = NULL;
    free(P.bitstream);  P.bitstream = NULL;
    free(P.sampleBuf);  P.sampleBuf = NULL;
-   free(P.fileBuf);    P.fileBuf = NULL;
-   P.fileCap = P.fileLen = 0;
+   free(P.headerBuf);  P.headerBuf = NULL;
+   P.headerLen = 0;
    P.nextSample = 0;
    P.queued = 0;
    memset(P.queue, 0, sizeof(P.queue));
@@ -204,20 +224,20 @@ BOOL player_play_url(const char *url)
 {
    player_stop();
 
-   // Techo del buffer local. 256 MiB cubre de sobra un clip razonable; lo
-   // que no quepa se corta con un mensaje claro en vez de corromper memoria.
-   P.fileCap = 256u * 1024 * 1024;
-   uint64_t total = 0;
+   // Solo se reserva sitio para la cabecera: el resto se lee de la ventana
+   // de red conforme avanza la reproducción, así que no hay límite de tamaño.
+   P.headerBuf = malloc(HEADER_PROBE);
+   if (!P.headerBuf) {
+      set_failed("sin memoria para la cabecera del video");
+      return FALSE;
+   }
+   P.headerLen = 0;
 
    if (!fetch_start(url)) {
       set_failed(fetch_error()[0] ? fetch_error() : "no se pudo iniciar la descarga");
       return FALSE;
    }
 
-   // El tamaño real llega con las cabeceras; se ajusta el buffer al saberlo.
-   (void)total;
-   P.fileBuf = NULL;
-   P.fileLen = 0;
    P.state = PLAYER_BUFFERING;
    P.framesShown = 0;
    WHBLogPrintf("[player] buffering: %s", url);
@@ -244,7 +264,7 @@ void player_toggle_pause(void)
 static BOOL try_open_media(void)
 {
    char err[160];
-   if (mp4_parse_memory_av(P.fileBuf, (uint32_t)P.fileLen, &P.vid, &P.aud,
+   if (mp4_parse_memory_av(P.headerBuf, P.headerLen, &P.vid, &P.aud,
                            err, sizeof(err)) != 0) {
       // Puede ser que aún falte el moov: seguir esperando salvo que ya esté todo
       if (fetch_state() == FETCH_DONE) set_failed(err);
@@ -309,27 +329,20 @@ static BOOL try_open_media(void)
    return TRUE;
 }
 
-// ¿Está el sample de audio `i` descargado?
-static BOOL audio_sample_ready(uint32_t i)
-{
-   Mp4Sample *s = &P.aud.samples[i];
-   return (s->offset + s->size) <= P.fileLen;
-}
-
 // Decodifica y encola audio mientras quepa en el anillo de salida.
 static void feed_audio(void)
 {
    if (!P.haveAudio) return;
 
    while (P.nextAudioSample < P.aud.sampleCount) {
-      if (!audio_sample_ready(P.nextAudioSample)) break;   // esperando red
+      if (!sample_available(&P.aud.samples[P.nextAudioSample])) break;  // esperando red
 
       // No decodificar por delante de lo que cabe: un frame AAC son 1024
       // muestras, así que con ese hueco basta.
       if (audio_out_space() < 2048) break;
 
       Mp4Sample *s = &P.aud.samples[P.nextAudioSample];
-      memcpy(P.audioSampleBuf, P.fileBuf + s->offset, s->size);
+      if (fetch_read(s->offset, P.audioSampleBuf, s->size) != (int)s->size) break;
 
       uint32_t frames = 0;
       const int16_t *pcm = aac_decoder_decode(P.audioSampleBuf, s->size, &frames);
@@ -339,41 +352,18 @@ static void feed_audio(void)
    }
 }
 
-// ¿Está el sample `i` completamente descargado?
-static BOOL sample_ready(uint32_t i)
-{
-   Mp4Sample *s = &P.vid.samples[i];
-   return (s->offset + s->size) <= P.fileLen;
-}
-
 BOOL player_update(void)
 {
-   // Asignar el buffer local en cuanto sepamos el tamaño del archivo
-   if (!P.fileBuf && (P.state == PLAYER_BUFFERING || P.state == PLAYER_PLAYING)) {
-      uint64_t total = fetch_total_size();
-      if (total > 0) {
-         if (total > P.fileCap) {
-            set_failed("archivo demasiado grande (mas de 256 MB)");
-            return FALSE;
-         }
-         P.fileCap = total;
-         P.fileBuf = malloc((size_t)total);
-         if (!P.fileBuf) { set_failed("sin memoria para el archivo"); return FALSE; }
-      } else if (fetch_state() == FETCH_ERROR) {
-         set_failed(fetch_error());
-         return FALSE;
-      } else {
-         return FALSE;   // aún sin cabeceras
-      }
-   }
-
    if (P.state == PLAYER_BUFFERING || P.state == PLAYER_PLAYING) {
-      drain_network();
       if (fetch_state() == FETCH_ERROR) { set_failed(fetch_error()); return FALSE; }
    }
 
    if (P.state == PLAYER_BUFFERING) {
-      if (P.fileLen >= HEADER_BYTES || fetch_state() == FETCH_DONE) {
+      drain_header();
+      // Se intenta abrir en cuanto haya prefijo suficiente. Si el moov aún no
+      // ha llegado entero, mp4_parse_memory_av falla sin ruido y se reintenta
+      // en el siguiente frame.
+      if (P.headerLen >= 256 * 1024 || fetch_state() == FETCH_DONE) {
          try_open_media();
       }
       return FALSE;
@@ -408,10 +398,10 @@ BOOL player_update(void)
 
    // Alimentar el decoder con lo que ya esté descargado
    while (P.queued < VIDEO_NUM_BUFFERS - 1 && P.nextSample < P.vid.sampleCount) {
-      if (!sample_ready(P.nextSample)) break;   // esperando a la red
+      if (!sample_available(&P.vid.samples[P.nextSample])) break;  // esperando red
 
       Mp4Sample *s = &P.vid.samples[P.nextSample];
-      memcpy(P.sampleBuf, P.fileBuf + s->offset, s->size);
+      if (fetch_read(s->offset, P.sampleBuf, s->size) != (int)s->size) break;
 
       uint32_t len = 0;
       if (P.nextSample == 0) {
@@ -441,6 +431,8 @@ BOOL player_update(void)
       }
    }
 
+   release_consumed();
+
    double pts;
    int due = take_due_frame(clock, &pts);
    if (due >= 0) {
@@ -457,6 +449,8 @@ const char *player_error(void)      { return P.error; }
 double player_position(void)        { return P.lastPts; }
 double player_duration(void)        { return P.haveVid ? P.vid.duration : 0.0; }
 uint32_t player_frames_shown(void)  { return P.framesShown; }
+
+double player_mbps(void) { return fetch_mbps(); }
 
 int player_progress_pct(void)
 {

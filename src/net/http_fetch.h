@@ -25,6 +25,7 @@ FetchState fetch_state(void);
 const char *fetch_error(void);      // mensaje legible si state == FETCH_ERROR
 uint64_t fetch_total_size(void);    // 0 si el servidor no dio Content-Length
 uint64_t fetch_downloaded(void);
+double fetch_mbps(void);            // velocidad media desde el primer byte
 uint32_t fetch_available(uint64_t offset);  // bytes contiguos legibles desde offset
 
 // Lee sin bloquear. Devuelve los bytes copiados (0 si aún no han llegado, o

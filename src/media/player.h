@@ -43,4 +43,5 @@ const char *player_error(void);
 double player_position(void);     // segundos reproducidos
 double player_duration(void);     // segundos totales (0 si se desconoce)
 int player_progress_pct(void);    // % descargado (-1 si no hay tamaño)
+double player_mbps(void);         // velocidad de descarga medida
 uint32_t player_frames_shown(void);
