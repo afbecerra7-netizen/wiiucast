@@ -92,9 +92,25 @@ static int handle_request(const char *method, const char *path, const char *quer
 
    // --- Recibir una URL para reproducir
    if (strcmp(path, "/cast") == 0) {
+      *contentType = "text/plain";
+
       if (strcmp(method, "POST") != 0 || body[0] == '\0') {
-         *contentType = "text/plain";
-         snprintf(out, outCap, "se esperaba POST con la URL en el cuerpo");
+         snprintf(out, outCap, "Falta la URL.");
+         return 400;
+      }
+      // Validación temprana: mejor un mensaje claro en el teléfono que un
+      // fallo silencioso cuando llegue el reproductor.
+      if (strncmp(body, "https://", 8) == 0) {
+         snprintf(out, outCap,
+                  "HTTPS todavia no: la consola no hace TLS. Usa http://");
+         return 400;
+      }
+      if (strncmp(body, "http://", 7) != 0) {
+         snprintf(out, outCap, "La URL tiene que empezar por http://");
+         return 400;
+      }
+      if (strlen(body) >= sizeof(g_app.url)) {
+         snprintf(out, outCap, "URL demasiado larga.");
          return 400;
       }
       snprintf(g_app.url, sizeof(g_app.url), "%s", body);
@@ -102,8 +118,6 @@ static int handle_request(const char *method, const char *path, const char *quer
       g_app.casts++;
       g_app.lastEvent = OSGetSystemTime();
       WHBLogPrintf("[cast] %s", g_app.url);
-
-      *contentType = "text/plain";
       snprintf(out, outCap, "ok");
       return 200;
    }
