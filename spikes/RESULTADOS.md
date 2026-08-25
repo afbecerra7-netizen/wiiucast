@@ -54,11 +54,28 @@ Archivos: testsrc2 60 s, libx264 High, `-bf 3`, yuv420p, faststart (720p L4.1 @6
 | avg ms/frame | **9.6** | **21.0** |
 | min / max ms/frame | 9.3 / 21.8 | 20.5 / 34.8 |
 | Margen vs presupuesto 33.3 ms | **3.5×** | **1.6×** |
-| ¿PGM se ven bien? | pendiente abrir en PC | pendiente abrir en PC |
+| ¿PGM correctos? | ✅ **bit-exacto** | ✅ **bit-exacto** |
 
 El reordenado es visible en los logs `[pts]`: entrada en orden decode (desordenada),
 salida perfectamente monótona. `status0=100` en ambos. El decoder reporta 1920×1088
 (alto codificado) para el archivo 1080p, como se esperaba.
+
+### Verificación visual: el decoder hardware es BIT-EXACTO vs ffmpeg
+
+Los volcados PGM de la consola se compararon contra el plano Y extraído en el PC con
+`ffmpeg -pix_fmt yuv420p -f rawvideo` (sin conversión de rango):
+
+```
+720p  frames 0/30/60: difieren 0 px de 921.600  | max delta 0
+1080p frames 0/30/60: difieren 0 px de 2.073.600 | max delta 0
+```
+
+Cero desviación. El H264DEC de la Wii U produce salida idéntica al decoder por software
+de ffmpeg — no hay pérdida, ni desplazamiento de pitch, ni artefactos.
+
+⚠️ Trampa al verificar: `ffmpeg -vf format=gray` **sí** convierte de rango limitado
+(16–235) a completo (0–255) y da falsos positivos (media de diferencia ~8, máx 17).
+Comparar siempre contra el plano Y crudo de `yuv420p`.
 
 **Escala lineal con los píxeles** (9.6 ms × 2.25 ≈ 21.0 ms medidos) → techo del decoder:
 **720p60 sí (9.6 < 16.6), 1080p30 sí (21.0 < 33.3), 1080p60 no (21.0 > 16.6).**
@@ -94,7 +111,10 @@ reproducción) mitiga para clips cortos.
 ☐ Replantear
 
 Pendientes no bloqueantes que hereda la Fase 1:
-1. S3 v2: `SO_RCVBUF` grande + descargas paralelas con Range; repetir con LAN adapter.
+1. S3 v2: `SO_RCVBUF` grande + descargas paralelas con Range. **Ojo al sesgo de la
+   medida actual: la Mac también estaba en Wi-Fi, así que cada byte cruzó el aire dos
+   veces.** Repetir con el PC por cable antes de sacar conclusiones. (No hay adaptador
+   LAN disponible para la consola.)
 2. Repetir sondeo de niveles 5.0/5.1 (salió de pantalla).
-3. Abrir los PGM de la SD en el PC para verificación visual del decode.
+3. ~~Verificación visual de los PGM~~ ✅ hecho: bit-exacto.
 4. Repetir S1 en una red con IGMP snooping activo.
