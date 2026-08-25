@@ -34,6 +34,23 @@ typedef struct {
    int hasBFrames;            // 1 si algún ctts offset != 0
 } Mp4Video;
 
+// --- Pista de audio ---------------------------------------------------------
+typedef enum { MP4_AUDIO_NONE = 0, MP4_AUDIO_AAC } Mp4AudioCodec;
+
+typedef struct {
+   Mp4AudioCodec codec;
+   int sampleRate;            // del sample entry (el ASC puede corregirlo)
+   int channels;
+
+   uint8_t asc[64];           // AudioSpecificConfig sacado del esds
+   uint32_t ascSize;          // 0 si no se encontró
+
+   Mp4Sample *samples;        // malloc'd; liberar con mp4_free_audio
+   uint32_t sampleCount;
+   uint32_t maxSampleSize;
+   double duration;
+} Mp4Audio;
+
 // 0 = ok; <0 = error (mensaje en errbuf)
 int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen);
 
@@ -42,4 +59,12 @@ int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen);
 int mp4_parse_memory(const uint8_t *data, uint32_t len, Mp4Video *out,
                      char *errbuf, size_t errlen);
 
+// Variante que además extrae la pista de audio. `audio` puede ser NULL; si no
+// hay pista de audio compatible, `audio->codec` queda en MP4_AUDIO_NONE (el
+// vídeo se reproduce igual, solo que mudo).
+int mp4_parse_memory_av(const uint8_t *data, uint32_t len,
+                        Mp4Video *video, Mp4Audio *audio,
+                        char *errbuf, size_t errlen);
+
 void mp4_free(Mp4Video *v);
+void mp4_free_audio(Mp4Audio *a);

@@ -424,6 +424,142 @@ int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen)
 }
 
 // ---------------------------------------------------------------------------
+// Pista de audio: mp4a + esds -> AudioSpecificConfig
+// ---------------------------------------------------------------------------
+
+// Los descriptores MPEG-4 llevan la longitud en base-128, 7 bits por byte.
+static uint32_t read_descr_len(const uint8_t *p, size_t avail, uint32_t *outBytes)
+{
+   uint32_t len = 0, used = 0;
+   while (used < 4 && used < avail) {
+      uint8_t b = p[used++];
+      len = (len << 7) | (b & 0x7F);
+      if (!(b & 0x80)) break;
+   }
+   *outBytes = used;
+   return len;
+}
+
+// Recorre el esds hasta el DecoderSpecificInfo (tag 0x05), que ES el
+// AudioSpecificConfig que faad2 necesita para inicializarse.
+static int parse_esds(const uint8_t *p, size_t len, Mp4Audio *a)
+{
+   if (len < 5) return -1;
+   size_t pos = 4;   // version + flags del FullBox
+
+   while (pos + 2 <= len) {
+      uint8_t tag = p[pos++];
+      uint32_t lenBytes = 0;
+      uint32_t dlen = read_descr_len(p + pos, len - pos, &lenBytes);
+      pos += lenBytes;
+      if (pos + dlen > len) return -1;
+
+      if (tag == 0x03) {            // ES_Descriptor: saltar ES_ID + flags
+         if (pos + 3 > len) return -1;
+         uint8_t flags = p[pos + 2];
+         pos += 3;
+         if (flags & 0x80) pos += 2;                        // dependsOn
+         if (flags & 0x40) { if (pos >= len) return -1; pos += 1 + p[pos]; }  // URL
+         if (flags & 0x20) pos += 2;                        // OCR
+         continue;                  // seguir hacia el DecoderConfigDescriptor
+      }
+      if (tag == 0x04) {            // DecoderConfigDescriptor
+         if (pos + 13 > len) return -1;
+         // objectTypeIndication 0x40 = AAC (MPEG-4 Audio)
+         if (p[pos] != 0x40) return -1;
+         pos += 13;
+         continue;                  // seguir hacia el DecSpecificInfo
+      }
+      if (tag == 0x05) {            // DecoderSpecificInfo = AudioSpecificConfig
+         if (dlen == 0 || dlen > sizeof(a->asc)) return -1;
+         memcpy(a->asc, p + pos, dlen);
+         a->ascSize = dlen;
+         return 0;
+      }
+      pos += dlen;                  // descriptor que no nos interesa
+   }
+   return -1;
+}
+
+// Devuelve 0 si este trak es la pista de audio y se parseó; 1 si no lo es;
+// <0 si lo es pero está rota o no es compatible.
+static int parse_audio_trak(const uint8_t *trak, size_t trakLen, Mp4Audio *a,
+                            char *errbuf, size_t errlen)
+{
+   size_t mdiaLen;
+   const uint8_t *mdia = find_box(trak, trakLen, FOURCC('m','d','i','a'), &mdiaLen, NULL);
+   if (!mdia) return 1;
+
+   size_t hdlrLen;
+   const uint8_t *hdlr = find_box(mdia, mdiaLen, FOURCC('h','d','l','r'), &hdlrLen, NULL);
+   if (!hdlr || hdlrLen < 12 || be32(hdlr + 8) != FOURCC('s','o','u','n')) return 1;
+
+   size_t mdhdLen;
+   const uint8_t *mdhd = find_box(mdia, mdiaLen, FOURCC('m','d','h','d'), &mdhdLen, NULL);
+   if (!mdhd || mdhdLen < 4) { ERR("audio sin mdhd"); return -1; }
+   uint32_t timescale;
+   if (mdhd[0] == 1) {
+      if (mdhdLen < 28) { ERR("audio mdhd v1 corto"); return -1; }
+      timescale = be32(mdhd + 20);
+   } else {
+      if (mdhdLen < 20) { ERR("audio mdhd v0 corto"); return -1; }
+      timescale = be32(mdhd + 12);
+   }
+   if (timescale == 0) { ERR("audio timescale 0"); return -1; }
+
+   size_t minfLen, stblLen, stsdLen;
+   const uint8_t *minf = find_box(mdia, mdiaLen, FOURCC('m','i','n','f'), &minfLen, NULL);
+   if (!minf) { ERR("audio sin minf"); return -1; }
+   const uint8_t *stbl = find_box(minf, minfLen, FOURCC('s','t','b','l'), &stblLen, NULL);
+   if (!stbl) { ERR("audio sin stbl"); return -1; }
+   const uint8_t *stsd = find_box(stbl, stblLen, FOURCC('s','t','s','d'), &stsdLen, NULL);
+   if (!stsd || stsdLen < 16) { ERR("audio sin stsd"); return -1; }
+
+   const uint8_t *entry = stsd + 8;
+   size_t entryAvail = stsdLen - 8;
+   if (entryAvail < 8) { ERR("audio stsd vacio"); return -1; }
+   uint32_t entrySize = be32(entry);
+   uint32_t entryType = be32(entry + 4);
+   if (entrySize > entryAvail) { ERR("audio sample entry truncado"); return -1; }
+
+   if (entryType != FOURCC('m','p','4','a')) {
+      ERR("pista de audio no es AAC (fourcc 0x%08x)", (unsigned)entryType);
+      return -1;
+   }
+
+   // AudioSampleEntry: 8 (header) + 8 (reserved+dataRefIndex) + 8 (version,
+   // revision, vendor) + 2 canales + 2 bits/sample + 2 pre_defined +
+   // 2 reserved + 4 sampleRate(16.16) = los hijos empiezan en +36
+   if (entrySize < 36) { ERR("audio sample entry corto"); return -1; }
+   a->channels   = be16(entry + 24);
+   a->sampleRate = (int)(be32(entry + 32) >> 16);
+
+   size_t esdsLen;
+   const uint8_t *esds = find_box(entry + 36, entrySize - 36,
+                                  FOURCC('e','s','d','s'), &esdsLen, NULL);
+   if (!esds) { ERR("audio sin esds"); return -1; }
+   if (parse_esds(esds, esdsLen, a) != 0) {
+      ERR("no se pudo leer la configuracion del audio (¿no es AAC-LC?)");
+      return -1;
+   }
+
+   // La tabla de samples se construye con el mismo código que la de vídeo:
+   // Mp4Video y Mp4Audio comparten la forma de los campos que usa.
+   Mp4Video tmp;
+   memset(&tmp, 0, sizeof(tmp));
+   if (build_samples(stbl, stblLen, timescale, &tmp, errbuf, errlen) != 0) {
+      free(tmp.samples);
+      return -1;
+   }
+   a->samples       = tmp.samples;
+   a->sampleCount   = tmp.sampleCount;
+   a->maxSampleSize = tmp.maxSampleSize;
+   a->duration      = tmp.duration;
+   a->codec         = MP4_AUDIO_AAC;
+   return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Variante sobre memoria: para reproducir mientras se descarga. `data` es el
 // principio del archivo y `len` lo que se lleva descargado, así que el moov
 // tiene que estar dentro de ese prefijo (MP4 con `-movflags +faststart`).
@@ -431,7 +567,15 @@ int mp4_parse(const char *path, Mp4Video *out, char *errbuf, size_t errlen)
 int mp4_parse_memory(const uint8_t *data, uint32_t len, Mp4Video *out,
                      char *errbuf, size_t errlen)
 {
+   return mp4_parse_memory_av(data, len, out, NULL, errbuf, errlen);
+}
+
+int mp4_parse_memory_av(const uint8_t *data, uint32_t len,
+                        Mp4Video *out, Mp4Audio *audioOut,
+                        char *errbuf, size_t errlen)
+{
    memset(out, 0, sizeof(*out));
+   if (audioOut) memset(audioOut, 0, sizeof(*audioOut));
    if (!data || len < 16) { ERR("aun no hay datos suficientes"); return -1; }
 
    const uint8_t *moov = NULL;
@@ -488,7 +632,32 @@ int mp4_parse_memory(const uint8_t *data, uint32_t len, Mp4Video *out,
    }
 
    if (!found) { ERR("%s", lastErr); return -1; }
+
+   // El audio es opcional: si falla, el vídeo se reproduce mudo en vez de
+   // rechazar el archivo entero.
+   if (audioOut) {
+      iter = NULL;
+      while ((trak = next_box_of(moov, moovLen, FOURCC('t','r','a','k'),
+                                 &trakLen, &iter)) != NULL) {
+         char aErr[128] = "";
+         int rc = parse_audio_trak(trak, trakLen, audioOut, aErr, sizeof(aErr));
+         if (rc == 0) break;
+         if (rc < 0) {
+            mp4_free_audio(audioOut);
+            memset(audioOut, 0, sizeof(*audioOut));
+         }
+      }
+   }
    return 0;
+}
+
+void mp4_free_audio(Mp4Audio *a)
+{
+   if (!a) return;
+   free(a->samples);
+   a->samples = NULL;
+   a->sampleCount = 0;
+   a->codec = MP4_AUDIO_NONE;
 }
 
 void mp4_free(Mp4Video *v)
