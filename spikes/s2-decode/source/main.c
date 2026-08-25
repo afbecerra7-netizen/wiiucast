@@ -34,7 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "mp4demux.h"
+#include "media/mp4demux.h"
 
 #define H264_MEM_ALIGNMENT   0x400
 #define FRAME_PITCH(w)       (((w) + 0xff) & ~0xff)

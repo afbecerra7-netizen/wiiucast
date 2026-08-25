@@ -8,15 +8,15 @@ endif
 
 TOPDIR ?= $(CURDIR)
 
-APP_NAME	:= WiiUCast S2 decode
-APP_SHORTNAME	:= wiiucast-s2
+APP_NAME	:= WiiUCast S4 display
+APP_SHORTNAME	:= wiiucast-s4
 APP_AUTHOR	:= wiiucast
 
 include $(DEVKITPRO)/wut/share/wut_rules
 
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
-SOURCES		:=	source ../../src/media
+SOURCES		:=	source ../../src/media ../../src/video
 DATA		:=	data
 INCLUDES	:=	../../src
 CONTENT		:=
