@@ -27,5 +27,9 @@ uint32_t audio_out_write(const int16_t *interleaved, uint32_t frames);
 uint64_t audio_out_played_frames(void);
 double audio_out_clock(void);      // segundos reproducidos
 
+// Frames escritos que aún no han sonado. Cuando llega a 0 y no queda nada
+// por decodificar, el audio se ha agotado y el reloj deja de avanzar.
+uint32_t audio_out_queued_frames(void);
+
 void audio_out_pause(BOOL paused);
 void audio_out_reset(void);        // vaciar el anillo (stop / seek)

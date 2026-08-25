@@ -200,6 +200,16 @@ double audio_out_clock(void)
    return (double)audio_out_played_frames() / (double)s_rate;
 }
 
+uint32_t audio_out_queued_frames(void)
+{
+   if (!s_ready) return 0;
+   OSLockMutex(&s_mutex);
+   uint64_t played = played_frames_locked();
+   uint64_t queued = (s_written > played) ? (s_written - played) : 0;
+   OSUnlockMutex(&s_mutex);
+   return (uint32_t)queued;
+}
+
 void audio_out_pause(BOOL paused)
 {
    if (!s_ready || paused == s_paused) return;

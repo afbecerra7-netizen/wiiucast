@@ -15,39 +15,21 @@ static void *s_user;
 static uint32_t s_framesOut, s_errors;
 static BOOL s_open;
 
-// El decoder no nos dice a qué buffer corresponde cada frame emitido: en modo
-// buffered la salida va desfasada respecto a la entrada. Se lleva una cola de
-// los índices en el orden en que se entregaron a Execute, y se consumen en
-// orden al emitir — que es el mismo orden en que el decoder los llena.
-#define PENDING_MAX 16
-static int s_pending[PENDING_MAX];
-static int s_pendHead, s_pendTail, s_pendCount;
-
-static void pending_push(int index)
-{
-   if (s_pendCount >= PENDING_MAX) return;   // no debería pasar
-   s_pending[s_pendTail] = index;
-   s_pendTail = (s_pendTail + 1) % PENDING_MAX;
-   s_pendCount++;
-}
-
-static int pending_pop(void)
-{
-   if (s_pendCount == 0) return -1;
-   int v = s_pending[s_pendHead];
-   s_pendHead = (s_pendHead + 1) % PENDING_MAX;
-   s_pendCount--;
-   return v;
-}
+// El callback corre SÍNCRONO dentro de H264DECExecute, y el decoder escribe
+// el frame que emite en el buffer que se le acaba de pasar a ESA llamada —
+// no en el de la llamada que metió ese frame (en modo buffered la salida va
+// desfasada de la entrada por el reordenado de B-frames). Por eso basta con
+// recordar el índice de la llamada en curso.
+static int s_currentIndex = -1;
 
 static void frame_callback(H264DecodeOutput *output)
 {
    for (int32_t i = 0; i < output->frameCount; i++) {
       H264DecodeResult *r = output->decodeResults[i];
-      int index = pending_pop();
       s_framesOut++;
-      if (index >= 0 && s_onFrame) {
-         s_onFrame(index, r->timestamp, r->width, r->height, r->nextLine, s_user);
+      if (s_currentIndex >= 0 && s_onFrame) {
+         s_onFrame(s_currentIndex, r->timestamp, r->width, r->height,
+                   r->nextLine, s_user);
       }
    }
 }
@@ -98,7 +80,7 @@ BOOL decoder_open(int profile, int level, int width, int height,
    s_onFrame = onFrame;
    s_user = user;
    s_framesOut = s_errors = 0;
-   s_pendHead = s_pendTail = s_pendCount = 0;
+   s_currentIndex = -1;
    s_open = TRUE;
 
    WHBLogPrintf("[dec] abierto: %dx%d perfil %d nivel %d (%u KB)",
@@ -117,14 +99,14 @@ BOOL decoder_submit(const uint8_t *annexb, uint32_t len, double pts,
       return FALSE;
    }
 
-   pending_push(index);
-
+   s_currentIndex = index;
    H264Error xe = H264DECExecute(s_mem, frameBuffer);
+   s_currentIndex = -1;
+
    // Convención heredada de moonlight: el byte bajo trae información de
    // estado; cualquier bit por encima señala error real.
    if (((uint32_t)xe & ~0xffu) != 0) {
       s_errors++;
-      pending_pop();   // ese buffer no va a emitirse
       return FALSE;
    }
    return TRUE;
@@ -132,6 +114,9 @@ BOOL decoder_submit(const uint8_t *annexb, uint32_t len, double pts,
 
 void decoder_flush(void)
 {
+   // Flush emite los frames retenidos por el callback. Van todos al mismo
+   // buffer (el último que se usó), así que el llamador debe consumirlos de
+   // uno en uno; en la práctica solo pasa al final del medio.
    if (s_open) H264DECFlush(s_mem);
 }
 

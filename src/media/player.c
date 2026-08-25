@@ -53,6 +53,12 @@ static struct {
    uint32_t framesShown;
    double lastPts;
    PlayerDisplayFn displayCb;
+
+   // Cuando el audio se agota (final del medio) su reloj deja de avanzar,
+   // así que se ancla al reloj del sistema para que el vídeo termine.
+   BOOL audioDrained;
+   OSTime drainAnchor;
+   double drainClock;
 } P;
 
 void player_set_display_cb(PlayerDisplayFn fn) { P.displayCb = fn; }
@@ -276,6 +282,7 @@ static BOOL try_open_media(void)
    P.nextSample = 0;
    P.nextAudioSample = 0;
    P.fbIndex = 0;
+   P.audioDrained = FALSE;
    P.clockStart = OSGetSystemTime();
    P.state = PLAYER_PLAYING;
    WHBLogPrintf("[player] reproduciendo%s", P.haveAudio ? " con audio" : " (mudo)");
@@ -359,9 +366,25 @@ BOOL player_update(void)
 
    // Reloj maestro: si hay audio, manda él. Un salto de audio se oye; un
    // frame de vídeo repetido o descartado, no. Sin audio, reloj del sistema.
-   double clock = P.haveAudio
-      ? audio_out_clock()
-      : OSTicksToMicroseconds(OSGetSystemTime() - P.clockStart) / 1e6;
+   //
+   // Salvedad importante: al acabarse las muestras de audio el reloj se
+   // quedaría clavado y el vídeo congelado (con el anillo aún sonando), así
+   // que al agotarse se pasa el testigo al reloj del sistema desde ese punto.
+   double clock;
+   if (!P.haveAudio) {
+      clock = OSTicksToMicroseconds(OSGetSystemTime() - P.clockStart) / 1e6;
+   } else if (P.audioDrained) {
+      clock = P.drainClock +
+              OSTicksToMicroseconds(OSGetSystemTime() - P.drainAnchor) / 1e6;
+   } else {
+      clock = audio_out_clock();
+      if (P.nextAudioSample >= P.aud.sampleCount && audio_out_queued_frames() == 0) {
+         P.audioDrained = TRUE;
+         P.drainAnchor = OSGetSystemTime();
+         P.drainClock = clock;
+         WHBLogPrintf("[player] audio agotado en %.2fs; sigo con reloj del sistema", clock);
+      }
+   }
 
    // Alimentar el decoder con lo que ya esté descargado
    while (P.queued < VIDEO_NUM_BUFFERS - 1 && P.nextSample < P.vid.sampleCount) {
