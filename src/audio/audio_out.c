@@ -4,6 +4,7 @@
 
 #include <coreinit/cache.h>
 #include <coreinit/mutex.h>
+#include <proc_ui/procui.h>
 #include <sndcore2/core.h>
 #include <sndcore2/voice.h>
 #include <sndcore2/drcvs.h>
@@ -28,6 +29,7 @@ static uint64_t s_playedBase;      // frames reproducidos en vueltas completas
 static uint32_t s_lastHwOffset;    // para detectar el salto del bucle
 static OSMutex s_mutex;
 static BOOL s_mutexReady;
+static BOOL s_callbacksRegistered;
 
 // Posición de lectura del hardware, en frames dentro del anillo.
 static uint32_t hw_offset(void)
@@ -48,6 +50,84 @@ static uint64_t played_frames_locked(void)
    return s_playedBase + cur;
 }
 
+// Suelta las voces sin tocar los anillos ni los contadores: al recuperar el
+// foreground se vuelven a crear y la reproducción continúa donde estaba.
+static void release_voices(void)
+{
+   for (int c = 0; c < AUDIO_MAX_CHANNELS; c++) {
+      if (!s_voice[c]) continue;
+      AXVoiceBegin(s_voice[c]);
+      AXSetVoiceState(s_voice[c], AX_VOICE_STATE_STOPPED);
+      AXVoiceEnd(s_voice[c]);
+      AXFreeVoice(s_voice[c]);
+      s_voice[c] = NULL;
+   }
+}
+
+static BOOL acquire_voices(void);
+
+static uint32_t on_fg_released(void *ctx)
+{
+   (void)ctx;
+   if (s_ready) release_voices();
+   return 0;
+}
+
+static uint32_t on_fg_acquired(void *ctx)
+{
+   (void)ctx;
+   if (s_ready && !s_voice[0]) acquire_voices();
+   return 0;
+}
+
+// Crea (o recrea) las voces AX y las arranca desde donde iba el anillo.
+static BOOL acquire_voices(void)
+{
+   if (!AXIsInit()) {
+      AXInitParams params = { .renderer = AX_INIT_RENDERER_48KHZ, .pipeline = 0 };
+      AXInitWithParams(&params);
+   }
+
+   for (int c = 0; c < s_channels; c++) {
+      if (s_voice[c]) continue;
+      s_voice[c] = AXAcquireVoice(31, NULL, NULL);
+      if (!s_voice[c]) { WHBLogPrintf("[audio] no hay voces AX libres"); return FALSE; }
+
+      AXVoiceBegin(s_voice[c]);
+      AXSetVoiceType(s_voice[c], 0);
+
+      AXVoiceVeData ve = { .volume = 0x8000, .delta = 0 };
+      AXSetVoiceVe(s_voice[c], &ve);
+
+      // Mezcla: este canal a su lado en la TV, y también al GamePad.
+      AXVoiceDeviceMixData mix[6];
+      memset(mix, 0, sizeof(mix));
+      mix[c % 2].bus[0].volume = 0x8000;
+      AXSetVoiceDeviceMix(s_voice[c], AX_DEVICE_TYPE_TV, 0, mix);
+      AXSetVoiceDeviceMix(s_voice[c], AX_DEVICE_TYPE_DRC, 0, mix);
+
+      // El renderer va a 48 kHz; si el medio viene a otra frecuencia, la voz
+      // la convierte sola con este ratio.
+      AXSetVoiceSrcType(s_voice[c], AX_VOICE_SRC_TYPE_LINEAR);
+      AXSetVoiceSrcRatio(s_voice[c], (float)s_rate / 48000.0f);
+
+      AXVoiceOffsets offsets;
+      memset(&offsets, 0, sizeof(offsets));
+      offsets.dataType       = AX_VOICE_FORMAT_LPCM16;
+      offsets.loopingEnabled = AX_VOICE_LOOP_ENABLED;
+      offsets.loopOffset     = 0;
+      offsets.endOffset      = RING_FRAMES - 1;
+      offsets.currentOffset  = s_lastHwOffset;   // continuar donde iba
+      offsets.data           = s_ring[c];
+      AXSetVoiceOffsets(s_voice[c], &offsets);
+
+      AXSetVoiceState(s_voice[c],
+                      s_paused ? AX_VOICE_STATE_STOPPED : AX_VOICE_STATE_PLAYING);
+      AXVoiceEnd(s_voice[c]);
+   }
+   return TRUE;
+}
+
 BOOL audio_out_init(int sampleRate, int channels)
 {
    audio_out_shutdown();
@@ -59,51 +139,15 @@ BOOL audio_out_init(int sampleRate, int channels)
 
    if (!s_mutexReady) { OSInitMutex(&s_mutex); s_mutexReady = TRUE; }
 
-   if (!AXIsInit()) {
-      AXInitParams params = { .renderer = AX_INIT_RENDERER_48KHZ, .pipeline = 0 };
-      AXInitWithParams(&params);
-   }
-
    for (int c = 0; c < s_channels; c++) {
       s_ring[c] = memalign(0x40, RING_FRAMES * sizeof(int16_t));
-      if (!s_ring[c]) { WHBLogPrintf("[audio] sin memoria para el anillo"); goto fail; }
+      if (!s_ring[c]) {
+         WHBLogPrintf("[audio] sin memoria para el anillo");
+         audio_out_shutdown();
+         return FALSE;
+      }
       memset(s_ring[c], 0, RING_FRAMES * sizeof(int16_t));
       DCFlushRange(s_ring[c], RING_FRAMES * sizeof(int16_t));
-
-      s_voice[c] = AXAcquireVoice(31, NULL, NULL);
-      if (!s_voice[c]) { WHBLogPrintf("[audio] no hay voces AX libres"); goto fail; }
-
-      AXVoiceBegin(s_voice[c]);
-      AXSetVoiceType(s_voice[c], 0);
-
-      // Volumen a fondo; el ajuste fino se hará por software si hace falta.
-      AXVoiceVeData ve = { .volume = 0x8000, .delta = 0 };
-      AXSetVoiceVe(s_voice[c], &ve);
-
-      // Mezcla: este canal a su lado en la TV, y también al GamePad.
-      AXVoiceDeviceMixData mix[6];
-      memset(mix, 0, sizeof(mix));
-      mix[c % 2].bus[0].volume = 0x8000;
-      AXSetVoiceDeviceMix(s_voice[c], AX_DEVICE_TYPE_TV, 0, mix);
-      AXSetVoiceDeviceMix(s_voice[c], AX_DEVICE_TYPE_DRC, 0, mix);
-
-      // Resampler: el renderer va a 48 kHz; si el medio viene a otra
-      // frecuencia, la voz la convierte sola con este ratio.
-      AXSetVoiceSrcType(s_voice[c], AX_VOICE_SRC_TYPE_LINEAR);
-      AXSetVoiceSrcRatio(s_voice[c], (float)s_rate / 48000.0f);
-
-      AXVoiceOffsets offsets;
-      memset(&offsets, 0, sizeof(offsets));
-      offsets.dataType       = AX_VOICE_FORMAT_LPCM16;
-      offsets.loopingEnabled = AX_VOICE_LOOP_ENABLED;
-      offsets.loopOffset     = 0;
-      offsets.endOffset      = RING_FRAMES - 1;
-      offsets.currentOffset  = 0;
-      offsets.data           = s_ring[c];
-      AXSetVoiceOffsets(s_voice[c], &offsets);
-
-      AXSetVoiceState(s_voice[c], AX_VOICE_STATE_PLAYING);
-      AXVoiceEnd(s_voice[c]);
    }
 
    s_writePos = 0;
@@ -111,14 +155,22 @@ BOOL audio_out_init(int sampleRate, int channels)
    s_playedBase = 0;
    s_lastHwOffset = 0;
    s_paused = FALSE;
-   s_ready = TRUE;
 
+   if (!acquire_voices()) { audio_out_shutdown(); return FALSE; }
+
+   // En Wii U el audio es un recurso del FOREGROUND: si la app se va a
+   // segundo plano (menú HOME) con voces vivas, el sistema se queda
+   // esperando y el cierre de la app se cuelga. Por eso se sueltan al perder
+   // la pantalla y se recrean al recuperarla.
+   if (!s_callbacksRegistered) {
+      ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, on_fg_acquired, NULL, 150);
+      ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, on_fg_released, NULL, 5);
+      s_callbacksRegistered = TRUE;
+   }
+
+   s_ready = TRUE;
    WHBLogPrintf("[audio] AX listo: %d Hz, %d canales", s_rate, s_channels);
    return TRUE;
-
-fail:
-   audio_out_shutdown();
-   return FALSE;
 }
 
 void audio_out_shutdown(void)
@@ -134,6 +186,9 @@ void audio_out_shutdown(void)
       free(s_ring[c]);
       s_ring[c] = NULL;
    }
+   // Soltar AX del todo: dejarlo inicializado al salir deja el subsistema de
+   // audio ocupado y el cierre de la app puede quedarse esperando.
+   if (s_ready && AXIsInit()) AXQuit();
    s_ready = FALSE;
 }
 

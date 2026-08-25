@@ -14,6 +14,12 @@
 BOOL video_renderer_init(void);
 void video_renderer_shutdown(void);
 
+// ¿Tenemos la pantalla? Al abrir el menú HOME el sistema nos manda a segundo
+// plano y nos quita los scan buffers: dibujar entonces cuelga la consola.
+// WHBProcIsRunning() sigue devolviendo TRUE en ese estado, así que hay que
+// consultar esto por separado antes de cada frame.
+BOOL video_renderer_has_foreground(void);
+
 // Reserva las texturas para un tamaño de vídeo. Puede llamarse otra vez al
 // cambiar de medio (libera las anteriores). Devuelve FALSE si no hay memoria.
 BOOL video_renderer_set_size(int width, int height);

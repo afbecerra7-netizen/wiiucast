@@ -165,19 +165,39 @@ static void free_playback(void)
    memset(P.queue, 0, sizeof(P.queue));
 }
 
-void player_stop(void)
+static void player_stop_internal(BOOL notifyDisplay)
 {
    fetch_stop();
    free_playback();
-   if (P.displayCb) P.displayCb(FALSE);   // devolver la pantalla a la UI
+   if (notifyDisplay && P.displayCb) P.displayCb(FALSE);
    P.state = PLAYER_IDLE;
    P.framesShown = 0;
    P.lastPts = 0;
 }
 
+void player_stop(void)
+{
+   player_stop_internal(TRUE);   // devolver la pantalla a la UI
+}
+
 void player_shutdown(void)
 {
-   player_stop();
+   // Al cerrar la app no se avisa a la pantalla: reasignar texturas mientras
+   // el sistema nos está quitando el foreground es justo lo que cuelga.
+   player_stop_internal(FALSE);
+}
+
+void player_release_hardware(void)
+{
+   if (P.state == PLAYER_IDLE) return;
+   WHBLogPrintf("[player] soltando hardware (perdimos el foreground)");
+   // Orden importante: primero los recursos de hardware, mientras todavía
+   // se nos permite tocarlos; la memoria y el hilo de red van después.
+   decoder_close();
+   aac_decoder_close();
+   audio_out_shutdown();
+   P.haveAudio = FALSE;
+   player_stop_internal(FALSE);
 }
 
 BOOL player_play_url(const char *url)

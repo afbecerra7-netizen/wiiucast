@@ -24,6 +24,12 @@ void player_set_display_cb(PlayerDisplayFn fn);
 BOOL player_init(void);
 void player_shutdown(void);
 
+// Suelta los recursos de hardware (decodificador H264, voces de audio). En
+// Wii U esos recursos pertenecen al foreground: hay que devolverlos en el
+// callback de RELEASE de ProcUI, o el sistema se queda esperando y la app se
+// cuelga al cerrarse. La reproducción se detiene.
+void player_release_hardware(void);
+
 // Empieza a reproducir una URL http://. Devuelve FALSE si no arrancó.
 BOOL player_play_url(const char *url);
 void player_stop(void);

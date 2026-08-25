@@ -14,6 +14,7 @@
 #include <gx2/texture.h>
 #include <gx2/utils.h>
 #include <gx2r/draw.h>
+#include <proc_ui/procui.h>
 
 #include <malloc.h>
 #include <string.h>
@@ -33,6 +34,12 @@ static YuvFrame s_frames[VIDEO_NUM_BUFFERS];
 static int s_visible = -1;       // último frame enviado a mostrar
 static int s_width, s_height;
 static BOOL s_ready = FALSE;
+static BOOL s_foreground = TRUE;
+
+static uint32_t on_acquired_fg(void *ctx) { (void)ctx; s_foreground = TRUE;  return 0; }
+static uint32_t on_released_fg(void *ctx) { (void)ctx; s_foreground = FALSE; return 0; }
+
+BOOL video_renderer_has_foreground(void) { return s_ready && s_foreground; }
 
 // Quad a pantalla completa. Posiciones en [0,1]; el vertex shader las
 // convierte a clip space con el uniform u_screenSize (ver display.vsh).
@@ -84,6 +91,13 @@ BOOL video_renderer_init(void)
    // izquierdo cuando el pitch alineado es mayor que el ancho visible.
    GX2InitSampler(&s_sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_LINEAR);
 
+   // Prioridades a los extremos para que el flag sea lo primero en apagarse
+   // al perder el foreground y lo último en encenderse al recuperarlo: así
+   // nunca se dibuja en la ventana en que WHBGfx está soltando sus buffers.
+   ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, on_acquired_fg, NULL, 200);
+   ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, on_released_fg, NULL, 10);
+
+   s_foreground = TRUE;
    s_ready = TRUE;
    WHBLogPrintf("[video] GX2 listo");
    return TRUE;
@@ -147,7 +161,10 @@ static BOOL create_frame(YuvFrame *f, int width, int height)
    // El plano UV empieza justo detrás del Y (imageSize de la superficie Y).
    f->uvTex.surface.image = (uint8_t *)f->yTex.surface.image + f->yTex.surface.imageSize;
 
-   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, f->yTex.surface.image, total);
+   // Sin foreground la GPU no es nuestra: invalidar entonces puede colgar.
+   if (s_foreground) {
+      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, f->yTex.surface.image, total);
+   }
    f->valid = TRUE;
    return TRUE;
 }
@@ -185,10 +202,12 @@ void video_renderer_submit(int index)
 {
    if (index < 0 || index >= VIDEO_NUM_BUFFERS || !s_frames[index].valid) return;
    // El decoder escribió con la CPU: hay que invalidar para que la GPU vea
-   // los datos nuevos y no una copia vieja en caché.
-   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
-                 s_frames[index].yTex.surface.image,
-                 VIDEO_FRAME_SIZE(s_width, s_height));
+   // los datos nuevos y no una copia vieja en caché. Solo con foreground.
+   if (s_foreground) {
+      GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,
+                    s_frames[index].yTex.surface.image,
+                    VIDEO_FRAME_SIZE(s_width, s_height));
+   }
    s_visible = index;
 }
 
@@ -219,7 +238,7 @@ static void draw_frame(void)
 
 void video_renderer_draw(BOOL haveVideo, float bgR, float bgG, float bgB)
 {
-   if (!s_ready) return;
+   if (!s_ready || !s_foreground) return;   // sin pantalla no se dibuja
 
    BOOL show = haveVideo && s_visible >= 0 && s_frames[s_visible].valid;
 
@@ -246,7 +265,8 @@ void video_renderer_shutdown(void)
    if (!s_ready) return;
    // Esperar a que la GPU termine antes de liberar texturas y shaders: si
    // sigue leyendo memoria que acabamos de soltar, la salida se cuelga.
-   GX2DrawDone();
+   // Solo con foreground: sin él la GPU no es nuestra y esperar bloquearía.
+   if (s_foreground) GX2DrawDone();
    free_frames();
    free(s_posBuf); s_posBuf = NULL;
    free(s_texBuf); s_texBuf = NULL;

@@ -17,6 +17,7 @@
 
 #include <coreinit/time.h>
 #include <coreinit/thread.h>
+#include <proc_ui/procui.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -202,6 +203,13 @@ static void draw_ui_frame(void)
    video_renderer_submit(0);
 }
 
+static uint32_t on_release_hw(void *ctx)
+{
+   (void)ctx;
+   player_release_hardware();
+   return 0;
+}
+
 // El reproductor pide la pantalla para el vídeo: se reconfiguran las texturas
 // a la resolución del medio. Al soltarla, se vuelve al lienzo de la UI.
 static BOOL on_display_request(BOOL wantVideo)
@@ -241,6 +249,13 @@ int main(int argc, char **argv)
    player_init();
    player_set_display_cb(on_display_request);
 
+   // Al abrir el menú HOME perdemos el foreground, y con él el derecho a usar
+   // el decodificador H264, las voces de audio y la GPU. Hay que devolverlos
+   // AQUÍ, que es el momento que ProcUI reserva para ello: intentar soltarlos
+   // más tarde (al cerrar la app) cuelga la consola. Prioridad alta para ir
+   // por delante de que WHBGfx suelte lo suyo.
+   ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, on_release_hw, NULL, 1);
+
    g_app.uiDirty = TRUE;
    g_app.lastState = PLAYER_IDLE;
 
@@ -253,6 +268,14 @@ int main(int argc, char **argv)
       if (ps != g_app.lastState) {
          g_app.lastState = ps;
          g_app.uiDirty = TRUE;
+      }
+
+      if (!video_renderer_has_foreground()) {
+         // Sin pantalla (menú HOME abierto): no se dibuja nada, y hay que
+         // dormir o el bucle giraría a tope sin la espera del vsync.
+         g_app.uiDirty = TRUE;   // redibujar al recuperar la pantalla
+         OSSleepTicks(OSMillisecondsToTicks(16));
+         continue;
       }
 
       if (hasVideo && (ps == PLAYER_PLAYING || ps == PLAYER_PAUSED)) {
