@@ -1,6 +1,8 @@
 #include "player.h"
 #include "mp4demux.h"
 
+#include "audio/aac_decoder.h"
+#include "audio/audio_out.h"
 #include "net/http_fetch.h"
 #include "video/decoder.h"
 #include "video/renderer.h"
@@ -28,6 +30,11 @@ static struct {
 
    Mp4Video vid;
    BOOL haveVid;
+
+   Mp4Audio aud;
+   BOOL haveAudio;         // hay pista de audio Y se pudo abrir el decoder
+   uint32_t nextAudioSample;
+   uint8_t *audioSampleBuf;
 
    uint8_t *fileBuf;      // copia local del archivo conforme llega
    uint64_t fileCap, fileLen;
@@ -136,7 +143,13 @@ BOOL player_init(void)
 static void free_playback(void)
 {
    decoder_close();
+   aac_decoder_close();
+   audio_out_shutdown();
    if (P.haveVid) { mp4_free(&P.vid); P.haveVid = FALSE; }
+   mp4_free_audio(&P.aud);
+   P.haveAudio = FALSE;
+   P.nextAudioSample = 0;
+   free(P.audioSampleBuf); P.audioSampleBuf = NULL;
    free(P.bitstream);  P.bitstream = NULL;
    free(P.sampleBuf);  P.sampleBuf = NULL;
    free(P.fileBuf);    P.fileBuf = NULL;
@@ -189,11 +202,14 @@ void player_toggle_pause(void)
 {
    if (P.state == PLAYER_PLAYING) {
       P.pausedAt = OSTicksToMicroseconds(OSGetSystemTime() - P.clockStart) / 1e6;
+      audio_out_pause(TRUE);
       P.state = PLAYER_PAUSED;
    } else if (P.state == PLAYER_PAUSED) {
-      // Reanudar: recolocar el origen del reloj para no saltar hacia adelante
+      // Reanudar: recolocar el origen del reloj para no saltar hacia adelante.
+      // Con audio no hace falta: su cursor se quedó parado donde estaba.
       P.clockStart = OSGetSystemTime() -
                      (OSTime)(P.pausedAt * (double)OSTimerClockSpeed);
+      audio_out_pause(FALSE);
       P.state = PLAYER_PLAYING;
    }
 }
@@ -202,7 +218,8 @@ void player_toggle_pause(void)
 static BOOL try_open_media(void)
 {
    char err[160];
-   if (mp4_parse_memory(P.fileBuf, (uint32_t)P.fileLen, &P.vid, err, sizeof(err)) != 0) {
+   if (mp4_parse_memory_av(P.fileBuf, (uint32_t)P.fileLen, &P.vid, &P.aud,
+                           err, sizeof(err)) != 0) {
       // Puede ser que aún falte el moov: seguir esperando salvo que ya esté todo
       if (fetch_state() == FETCH_DONE) set_failed(err);
       return FALSE;
@@ -237,12 +254,62 @@ static BOOL try_open_media(void)
       return FALSE;
    }
 
+   // --- Audio (opcional: si falla, el vídeo se reproduce mudo)
+   if (P.aud.codec == MP4_AUDIO_AAC && P.aud.sampleCount > 0) {
+      int rate = 0, channels = 0;
+      if (aac_decoder_open(P.aud.asc, P.aud.ascSize, &rate, &channels) &&
+          audio_out_init(rate, channels)) {
+         P.audioSampleBuf = malloc(P.aud.maxSampleSize);
+         if (P.audioSampleBuf) {
+            P.haveAudio = TRUE;
+            WHBLogPrintf("[player] audio AAC %d Hz %d ch, %u frames",
+                         rate, channels, P.aud.sampleCount);
+         }
+      }
+      if (!P.haveAudio) {
+         WHBLogPrintf("[player] audio no disponible; reproduccion muda");
+         aac_decoder_close();
+         audio_out_shutdown();
+      }
+   }
+
    P.nextSample = 0;
+   P.nextAudioSample = 0;
    P.fbIndex = 0;
    P.clockStart = OSGetSystemTime();
    P.state = PLAYER_PLAYING;
-   WHBLogPrintf("[player] reproduciendo");
+   WHBLogPrintf("[player] reproduciendo%s", P.haveAudio ? " con audio" : " (mudo)");
    return TRUE;
+}
+
+// ¿Está el sample de audio `i` descargado?
+static BOOL audio_sample_ready(uint32_t i)
+{
+   Mp4Sample *s = &P.aud.samples[i];
+   return (s->offset + s->size) <= P.fileLen;
+}
+
+// Decodifica y encola audio mientras quepa en el anillo de salida.
+static void feed_audio(void)
+{
+   if (!P.haveAudio) return;
+
+   while (P.nextAudioSample < P.aud.sampleCount) {
+      if (!audio_sample_ready(P.nextAudioSample)) break;   // esperando red
+
+      // No decodificar por delante de lo que cabe: un frame AAC son 1024
+      // muestras, así que con ese hueco basta.
+      if (audio_out_space() < 2048) break;
+
+      Mp4Sample *s = &P.aud.samples[P.nextAudioSample];
+      memcpy(P.audioSampleBuf, P.fileBuf + s->offset, s->size);
+
+      uint32_t frames = 0;
+      const int16_t *pcm = aac_decoder_decode(P.audioSampleBuf, s->size, &frames);
+      P.nextAudioSample++;
+
+      if (pcm && frames > 0) audio_out_write(pcm, frames);
+   }
 }
 
 // ¿Está el sample `i` completamente descargado?
@@ -288,7 +355,13 @@ BOOL player_update(void)
    if (P.state == PLAYER_PAUSED) return P.framesShown > 0;
    if (P.state != PLAYER_PLAYING) return FALSE;
 
-   double clock = OSTicksToMicroseconds(OSGetSystemTime() - P.clockStart) / 1e6;
+   feed_audio();
+
+   // Reloj maestro: si hay audio, manda él. Un salto de audio se oye; un
+   // frame de vídeo repetido o descartado, no. Sin audio, reloj del sistema.
+   double clock = P.haveAudio
+      ? audio_out_clock()
+      : OSTicksToMicroseconds(OSGetSystemTime() - P.clockStart) / 1e6;
 
    // Alimentar el decoder con lo que ya esté descargado
    while (P.queued < VIDEO_NUM_BUFFERS - 1 && P.nextSample < P.vid.sampleCount) {
@@ -312,7 +385,7 @@ BOOL player_update(void)
       P.nextSample++;
    }
 
-   // Fin del medio
+   // Fin del medio (el vídeo manda: si el audio dura un pelín más, da igual)
    if (P.nextSample >= P.vid.sampleCount && P.queued == 0) {
       decoder_flush();
       if (P.queued == 0) {

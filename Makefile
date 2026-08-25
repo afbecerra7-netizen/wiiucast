@@ -16,7 +16,7 @@ include $(DEVKITPRO)/wut/share/wut_rules
 
 TARGET		:=	wiiucast
 BUILD		:=	build
-SOURCES		:=	src src/net src/ui src/video src/media
+SOURCES		:=	src src/net src/ui src/video src/media src/audio
 DATA		:=	data
 INCLUDES	:=	src
 CONTENT		:=
@@ -34,7 +34,7 @@ CXXFLAGS	:= $(CFLAGS)
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-g $(ARCH) $(RPXSPECS) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lwut
+LIBS	:= -lfaad -lm -lwut
 
 LIBDIRS	:= $(PORTLIBS) $(WUT_ROOT)
 
